@@ -6,6 +6,7 @@ SVN Manager — 多项目 Subversion 图形客户端
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -190,6 +191,56 @@ def do_commit(root, paths, message, add_unversioned=True):
             os.unlink(tf)
         except OSError:
             pass
+
+
+def do_delete(root, paths):
+    """删除：已纳管的走 svn delete（标记为 D，可提交），未纳管的直接删磁盘"""
+    if not paths:
+        return {"ok": False, "output": "没有选中任何文件"}
+    items, _ = parse_status(root)
+    unver = {i["path"] for i in items if i["code"] == "?"}
+
+    abs_paths = []
+    for rel in paths:
+        try:
+            abs_paths.append(safe_join(root, rel))
+        except ValueError as e:
+            return {"ok": False, "output": str(e)}
+
+    to_svn, to_fs = [], []
+    for rel, ap in zip(paths, abs_paths):
+        (to_fs if rel in unver else to_svn).append(ap)
+
+    msgs = []
+    if to_svn:
+        fd, tf = tempfile.mkstemp(prefix="svnmg-", suffix=".txt")
+        os.close(fd)
+        try:
+            with open(tf, "w", encoding="utf-8") as f:
+                for p in to_svn:
+                    f.write(p + "\n")
+            rc, out, err = svn(["delete", "--force", "--non-interactive",
+                                "--targets", tf], cwd=root, timeout=300)
+            msgs.append((out + err).strip())
+            if rc != 0:
+                return {"ok": False, "output": "\n".join(msgs)}
+        finally:
+            try:
+                os.unlink(tf)
+            except OSError:
+                pass
+
+    for ap in to_fs:
+        try:
+            if os.path.isdir(ap) and not os.path.islink(ap):
+                shutil.rmtree(ap)
+            elif os.path.exists(ap) or os.path.islink(ap):
+                os.remove(ap)
+            msgs.append("已删除（未纳管，直接移除文件）: " + os.path.relpath(ap, root))
+        except Exception as e:
+            msgs.append("删除失败 %s: %s" % (os.path.relpath(ap, root), e))
+
+    return {"ok": True, "output": "\n".join(m for m in msgs if m)}
 
 
 def do_log(root, limit=30):
@@ -394,6 +445,12 @@ class Handler(BaseHTTPRequestHandler):
             rc, out, err = svn(["cleanup", "--non-interactive"], cwd=pr["path"], timeout=600)
             return self._json({"ok": rc == 0, "output": (out + err).strip()})
 
+        if p == "/api/delete":
+            pr = find_project(b.get("name"))
+            if not pr:
+                return self._json({"ok": False, "output": "项目不存在"})
+            return self._json(do_delete(pr["path"], b.get("paths") or []))
+
         if p == "/api/commit":
             pr = find_project(b.get("name"))
             if not pr:
@@ -507,6 +564,8 @@ td.pth{font-family:"SF Mono",Menlo,monospace;font-size:12px;word-break:break-all
 td.act{width:1%;white-space:nowrap;text-align:right}
 td.act button{padding:2px 8px;font-size:11px;background:transparent;border-color:transparent;color:var(--accent)}
 td.act button:hover{background:var(--accent-soft)}
+td.act button.del{color:var(--red)}
+td.act button.del:hover{background:rgba(255,59,48,.12)}
 .badge{display:inline-block;min-width:22px;text-align:center;font-size:11px;font-weight:700;
   padding:1px 6px;border-radius:5px;font-family:"SF Mono",Menlo,monospace}
 .badge.lbl{font-family:inherit;font-weight:600;margin-left:6px;min-width:auto;white-space:nowrap}
@@ -524,7 +583,9 @@ td.act button:hover{background:var(--accent-soft)}
 .commitbar{flex:none;border-top:1px solid var(--line);background:var(--panel);padding:10px 16px;
   display:flex;gap:10px;align-items:flex-end}
 .commitbar textarea{resize:none;height:52px;font-size:12px}
-.commitbar .side{display:flex;flex-direction:column;gap:6px;align-items:stretch;min-width:130px}
+.commitbar .side{display:flex;flex-direction:column;gap:6px;align-items:stretch;min-width:210px}
+.btnrow{display:flex;gap:6px}
+.btnrow button{flex:1;white-space:nowrap}
 .hint{font-size:11px;color:var(--muted)}
 .rowtop{display:flex;align-items:center;gap:8px;margin-bottom:8px}
 .selall{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;user-select:none}
@@ -608,7 +669,10 @@ pre.diff .hunk{color:var(--accent)}
       </div>
       <div class="side">
         <div class="hint" id="selhint">已选 0 项</div>
-        <button class="primary" id="btnCommit" onclick="doCommit()" disabled>提交选中</button>
+        <div class="btnrow">
+          <button class="primary" id="btnCommit" onclick="doCommit()" disabled>提交选中</button>
+          <button class="danger" id="btnDel" onclick="delSelected()" disabled>删除选中</button>
+        </div>
       </div>
     </div>
   </main>
@@ -735,6 +799,7 @@ function renderStatus(){
           <td class="act">
             ${it.code==='?'?'':`<button onclick="showDiff('${esc(it.path).replace(/'/g,"\\'")}')">差异</button>`}
             <button onclick="reveal('${esc(it.path).replace(/'/g,"\\'")}')">定位</button>
+            <button class="del" onclick="delOne('${esc(it.path).replace(/'/g,"\\'")}')">删除</button>
           </td>
         </tr>`).join('')}
       </tbody>
@@ -753,8 +818,9 @@ function toggleOne(i, on){
 }
 function updateSelHint(){
   const n = S.sel.size;
-  $('#selhint').textContent = '已选 ' + n + ' 项';
-  $('#btnCommit').disabled = n===0;
+  const el = $('#selhint'); if(el) el.textContent = '已选 ' + n + ' 项';
+  const bc = $('#btnCommit'); if(bc) bc.disabled = n===0;
+  const bd = $('#btnDel'); if(bd) bd.disabled = n===0;
 }
 async function showDiff(path){
   $('#body').classList.add('loading');
@@ -787,6 +853,31 @@ async function doCleanup(){
   toast(d.ok?'清理完成':'清理出错');
   $('#body').innerHTML = `<pre class="out">${esc(d.output||'')}</pre>`;
   await loadStatus();
+}
+async function delOne(p){
+  if(!confirm('确定删除？\n\n' + p + '\n\n· 已纳入版本控制 → 标记为删除，提交后生效（可撤销）\n· 未纳管 → 直接从磁盘移除文件')) return;
+  await doDelete([p]);
+}
+async function delSelected(){
+  const paths = [...S.sel];
+  if(!paths.length) return;
+  const list = paths.slice(0, 8).join('\n') + (paths.length > 8 ? '\n… 共 ' + paths.length + ' 项' : '');
+  if(!confirm('确定删除选中的 ' + paths.length + ' 项？\n\n' + list)) return;
+  await doDelete(paths);
+}
+async function doDelete(paths){
+  $('#body').classList.add('loading');
+  toast('正在删除…', 30000);
+  const d = await api('/api/delete', {name:S.cur, paths});
+  $('#body').classList.remove('loading');
+  if(d.ok){
+    toast('✓ 已删除 ' + paths.length + ' 项', 3000);
+    S.sel.clear();
+    await refreshAll(); await loadStatus();
+  } else {
+    toast('✗ 删除失败', 4000);
+    $('#body').innerHTML = `<pre class="out">${esc(d.output||'')}</pre>`;
+  }
 }
 async function doCommit(){
   const paths = [...S.sel];
