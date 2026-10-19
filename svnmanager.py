@@ -122,12 +122,22 @@ def parse_status(root):
         if not rel:
             continue
         kind, label = CODE_LABEL[code]
+        full = os.path.join(root, rel)
+        try:
+            mtime = int(os.stat(full).st_mtime)
+        except OSError:
+            mtime = None  # 缺失/删除的条目没有本地文件
         items.append({
             "path": rel, "code": code, "kind": kind,
             "label": label, "tree": tree_c,
-            "is_dir": os.path.isdir(os.path.join(root, rel)),
+            "is_dir": os.path.isdir(full), "mtime": mtime,
         })
-    items.sort(key=lambda x: (RANK.get(x["code"], 99), x["path"]))
+    # 冲突/缺失置顶（需要处理），其余按本地修改时间倒序
+    items.sort(key=lambda x: (
+        0 if x["code"] in ("C", "!") else 1,
+        -(x["mtime"] or 0),
+        x["path"],
+    ))
     return items, None
 
 
@@ -554,7 +564,8 @@ main{flex:1;display:flex;flex-direction:column;min-width:0}
 table{width:100%;border-collapse:collapse;background:var(--card);border-radius:10px;overflow:hidden;
   border:1px solid var(--line)}
 th{text-align:left;font-size:11px;color:var(--muted);font-weight:600;padding:8px 12px;
-  border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:1}
+  border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:1;
+  white-space:nowrap}
 td{padding:6px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
 tr:last-child td{border-bottom:none}
 tr.row:hover{background:var(--hover)}
@@ -562,6 +573,8 @@ tr.row.sel{background:var(--accent-soft)}
 td.cb{width:34px}
 td.pth{font-family:"SF Mono",Menlo,monospace;font-size:12px;word-break:break-all}
 td.act{width:1%;white-space:nowrap;text-align:right}
+td.tm{width:1%;white-space:nowrap;text-align:right;color:var(--muted);
+  font-size:11px;font-variant-numeric:tabular-nums;padding-left:0}
 td.act button{padding:2px 8px;font-size:11px;background:transparent;border-color:transparent;color:var(--accent)}
 td.act button:hover{background:var(--accent-soft)}
 td.act button.del{color:var(--red)}
@@ -717,6 +730,25 @@ async function api(path, opt){
 }
 function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+/* 本地修改时间：相对时间显示，鼠标悬停看完整时间 */
+function fmtTime(ts){
+  if(!ts) return '—';
+  const d = new Date(ts*1000), diff = (Date.now() - d.getTime())/1000;
+  if(diff < 60) return '刚刚';
+  if(diff < 3600) return Math.floor(diff/60) + ' 分钟前';
+  if(diff < 86400) return Math.floor(diff/3600) + ' 小时前';
+  if(diff < 86400*7) return Math.floor(diff/86400) + ' 天前';
+  const p = n => String(n).padStart(2,'0');
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return sameYear ? `${p(d.getMonth()+1)}-${p(d.getDate())}`
+                  : `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`;
+}
+function fullTime(ts){
+  if(!ts) return '本地文件不存在（已删除或缺失）';
+  const d = new Date(ts*1000), p = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 async function refreshAll(){
   const d = await api('/api/projects');
   S.projects = d.projects || [];
@@ -788,7 +820,7 @@ function renderStatus(){
       <span class="hint">共 ${items.length} 项 · 冲突 ${items.filter(i=>i.code==='C').length}${(!S.showUnver&&hidden)?` · 已隐藏 ${hidden} 个未纳管`:''}</span>
     </div>
     <table>
-      <thead><tr><th class="cb"></th><th style="width:140px">状态</th><th>路径</th><th></th></tr></thead>
+      <thead><tr><th class="cb"></th><th style="width:140px">状态</th><th>路径</th><th style="width:92px">修改时间</th><th></th></tr></thead>
       <tbody>
       ${items.map((it,i)=>`
         <tr class="row ${S.sel.has(it.path)?'sel':''}" data-p="${esc(it.path)}">
@@ -796,6 +828,7 @@ function renderStatus(){
               onchange="toggleOne(${i},this.checked)"></td>
           <td><span class="badge b-${esc(it.code)}">${esc(it.code)}</span><span class="badge lbl" style="color:var(--muted)">${esc(it.label)}</span></td>
           <td class="pth">${it.is_dir?'<span class="dir">▸</span>':''}${esc(it.path)}</td>
+          <td class="tm" title="${fullTime(it.mtime)}">${fmtTime(it.mtime)}</td>
           <td class="act">
             ${it.code==='?'?'':`<button onclick="showDiff('${esc(it.path).replace(/'/g,"\\'")}')">差异</button>`}
             <button onclick="reveal('${esc(it.path).replace(/'/g,"\\'")}')">定位</button>
