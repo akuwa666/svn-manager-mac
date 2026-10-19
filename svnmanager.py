@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import uuid
 import webbrowser
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -160,6 +162,112 @@ def find_project(name):
         if p["name"] == name:
             return p
     return None
+
+
+def register_project(path, name=""):
+    """注册一个工作副本，名字冲突自动加后缀。返回 (ok, name或错误信息)"""
+    if not path or not os.path.isdir(path):
+        return False, "目录不存在"
+    if not os.path.isdir(os.path.join(path, ".svn")):
+        return False, "这个目录不是 SVN 工作副本（没有 .svn）"
+    path = os.path.realpath(path)
+    if not name:
+        name = os.path.basename(path.rstrip("/\\")) or "project"
+    d = load_conf()
+    if any(x["name"] == name for x in d["projects"]):
+        i = 2
+        while any(x["name"] == "%s-%d" % (name, i) for x in d["projects"]):
+            i += 1
+        name = "%s-%d" % (name, i)
+    d["projects"].append({"name": name, "path": path})
+    save_conf(d)
+    return True, name
+
+
+# ─────────────────────────── 检出（checkout）任务 ───────────────────────────
+CHECKOUT_TASKS = {}
+CHECKOUT_PROCS = {}
+TASK_LOCK = threading.Lock()
+
+DEPTHS = ("infinity", "immediates", "files", "empty")
+
+
+def _task_update(tid, **kw):
+    with TASK_LOCK:
+        t = CHECKOUT_TASKS.get(tid)
+        if t:
+            t.update(kw)
+
+
+def get_task(tid):
+    with TASK_LOCK:
+        t = CHECKOUT_TASKS.get(tid)
+        return dict(t) if t else None
+
+
+def start_checkout(url, path, name="", username="", password="", depth="infinity"):
+    tid = uuid.uuid4().hex[:10]
+    with TASK_LOCK:
+        CHECKOUT_TASKS[tid] = {
+            "id": tid, "status": "running", "url": url, "path": path,
+            "name": name, "count": 0, "lines": [], "error": "",
+            "started": time.time(), "returncode": None, "project": "",
+        }
+    threading.Thread(
+        target=_checkout_worker,
+        args=(tid, url, path, name, username, password, depth),
+        daemon=True,
+    ).start()
+    return tid
+
+
+def _checkout_worker(tid, url, path, name, username, password, depth):
+    args = ["checkout", "--non-interactive", "--depth", depth, url, path]
+    if username:
+        args += ["--username", username]
+    if password:
+        args += ["--password", password]
+
+    lines, count = [], 0
+    try:
+        proc = subprocess.Popen(
+            [SVN_BIN] + args,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=SVN_ENV, creationflags=_NO_WINDOW,
+        )
+        with TASK_LOCK:
+            CHECKOUT_PROCS[tid] = proc
+
+        for raw in iter(proc.stdout.readline, b""):
+            line = _dec(raw).rstrip()
+            if not line:
+                continue
+            lines.append(line)
+            if line[:1] in ("A", "D", "U", "C", "E"):
+                count += 1
+            if len(lines) > 300:
+                del lines[:150]
+            _task_update(tid, lines=list(lines), count=count)
+
+        proc.wait()
+        with TASK_LOCK:
+            CHECKOUT_PROCS.pop(tid, None)
+
+        if proc.returncode == 0:
+            ok, res = register_project(path, name)
+            if ok:
+                _task_update(tid, status="done", project=res,
+                             returncode=0, lines=lines[-40:])
+            else:
+                _task_update(tid, status="error", returncode=0,
+                             error="检出成功，但注册项目失败：" + res,
+                             lines=lines[-40:])
+        else:
+            _task_update(tid, status="error", returncode=proc.returncode,
+                         error="svn 退出码 %d" % proc.returncode,
+                         lines=lines[-60:])
+    except Exception as e:
+        _task_update(tid, status="error", error=str(e), lines=lines[-40:])
 
 
 def safe_join(root, rel):
@@ -461,6 +569,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": err, "items": []})
             return self._json({"items": items, "rev": project_rev(pr["path"])})
 
+        if p == "/api/checkout/status":
+            t = get_task((q.get("id") or [""])[0])
+            if not t:
+                return self._json({"error": "任务不存在"}, 404)
+            return self._json(t)
+
         if p == "/api/log":
             pr = find_project((q.get("name") or [""])[0])
             if not pr:
@@ -522,23 +636,48 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/project/add":
             path = os.path.expanduser((b.get("path") or "").strip())
+            ok, res = register_project(path, (b.get("name") or "").strip())
+            if not ok:
+                return self._json({"ok": False, "error": res})
+            return self._json({"ok": True, "name": res})
+
+        if p == "/api/checkout":
+            url = (b.get("url") or "").strip()
+            path = os.path.expanduser((b.get("path") or "").strip())
             name = (b.get("name") or "").strip()
-            if not path or not os.path.isdir(path):
-                return self._json({"ok": False, "error": "目录不存在"})
-            if not os.path.isdir(os.path.join(path, ".svn")):
-                return self._json({"ok": False, "error": "这个目录不是 SVN 工作副本（没有 .svn）"})
-            path = os.path.realpath(path)
-            if not name:
-                name = os.path.basename(path)
-            d = load_conf()
-            if any(x["name"] == name for x in d["projects"]):
-                i = 2
-                while any(x["name"] == "%s-%d" % (name, i) for x in d["projects"]):
-                    i += 1
-                name = "%s-%d" % (name, i)
-            d["projects"].append({"name": name, "path": path})
-            save_conf(d)
-            return self._json({"ok": True, "name": name})
+            depth = b.get("depth") or "infinity"
+            if depth not in DEPTHS:
+                depth = "infinity"
+            if not url:
+                return self._json({"ok": False, "error": "请填写 SVN 地址"})
+            if not path:
+                return self._json({"ok": False, "error": "请填写保存路径"})
+            if os.path.exists(path):
+                if not os.path.isdir(path):
+                    return self._json({"ok": False, "error": "目标路径已存在且不是目录"})
+                try:
+                    if os.listdir(path):
+                        return self._json({"ok": False,
+                                           "error": "目标目录不为空，请换一个空目录或新路径"})
+                except OSError as e:
+                    return self._json({"ok": False, "error": "无法读取目标目录：%s" % e})
+            else:
+                parent = os.path.dirname(os.path.abspath(path))
+                if not os.path.isdir(parent):
+                    return self._json({"ok": False, "error": "上级目录不存在：%s" % parent})
+            tid = start_checkout(url, path, name,
+                                 b.get("username") or "", b.get("password") or "", depth)
+            return self._json({"ok": True, "id": tid})
+
+        if p == "/api/checkout/cancel":
+            tid = b.get("id") or ""
+            with TASK_LOCK:
+                proc = CHECKOUT_PROCS.get(tid)
+            if proc and proc.poll() is None:
+                proc.terminate()
+                _task_update(tid, status="cancelled", error="已取消")
+                return self._json({"ok": True})
+            return self._json({"ok": False, "error": "任务不在运行中"})
 
         if p == "/api/project/remove":
             name = b.get("name")
@@ -719,6 +858,13 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);cursor:po
 .modal{background:var(--card);border-radius:14px;width:560px;max-height:76vh;display:flex;flex-direction:column;
   box-shadow:0 20px 60px rgba(0,0,0,.35);border:1px solid var(--line)}
 .modal h3{margin:0;padding:14px 16px;font-size:14px;border-bottom:1px solid var(--line)}
+.seg{display:flex;gap:6px;padding:12px 16px 0}
+.segbtn{flex:1;padding:7px 10px;font-size:12px;border-radius:8px;background:var(--card);border:1px solid var(--line)}
+.segbtn.on{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
+.segbtn.on:hover{background:var(--accent);filter:brightness(1.08)}
+select{font:inherit;background:var(--card);color:var(--fg);border:1px solid var(--line);
+  border-radius:7px;padding:7px 10px;width:100%;outline:none;cursor:pointer}
+select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .modal .c{padding:14px 16px;overflow:auto;flex:1}
 .modal .f{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
 .browse{max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:8px;margin-top:8px}
@@ -796,20 +942,54 @@ pre.diff .hunk{color:var(--accent)}
 <div class="mask" id="mask" onclick="if(event.target===this)closeModal()">
   <div class="modal">
     <h3>添加 SVN 项目</h3>
+    <div class="seg">
+      <button class="segbtn on" id="segExist" onclick="setAddTab('exist')">已有工作副本</button>
+      <button class="segbtn" id="segCo" onclick="setAddTab('checkout')">从服务器检出</button>
+    </div>
     <div class="c">
-      <label class="hint">项目路径（必须是已有 .svn 的工作副本目录）</label>
-      <input id="newpath" placeholder="/Users/you/Desktop/项目名" style="margin:6px 0 8px">
-      <label class="hint">显示名称（留空则用目录名）</label>
-      <input id="newname" placeholder="例如 newSVN" style="margin:6px 0 10px">
-      <div class="rowtop">
-        <button onclick="browse(document.getElementById('newpath').value||'~')">浏览…</button>
-        <span class="crumb" id="crumb"></span>
+      <div id="paneExist">
+        <label class="hint">项目路径（必须是已有 .svn 的工作副本目录）</label>
+        <input id="newpath" placeholder="/Users/you/Desktop/项目名" style="margin:6px 0 8px">
+        <label class="hint">显示名称（留空则用目录名）</label>
+        <input id="newname" placeholder="例如 newSVN" style="margin:6px 0 10px">
+        <div class="rowtop">
+          <button onclick="browse(document.getElementById('newpath').value||'~','newpath')">浏览…</button>
+          <span class="crumb" id="crumb"></span>
+        </div>
+        <div class="browse" id="browse" style="display:none"></div>
       </div>
-      <div class="browse" id="browse" style="display:none"></div>
+
+      <div id="paneCo" style="display:none">
+        <label class="hint">SVN 地址</label>
+        <input id="coUrl" placeholder="svn://svn.example.com/repo/项目名" style="margin:6px 0 8px">
+        <label class="hint">保存到（目录必须为空或不存在）</label>
+        <input id="coPath" placeholder="/Users/you/Desktop/项目名" style="margin:6px 0 6px">
+        <div class="rowtop">
+          <button onclick="browse(document.getElementById('coPath').value||'~','coPath')">浏览…</button>
+          <span class="crumb" id="coCrumb"></span>
+        </div>
+        <div class="browse" id="coBrowse" style="display:none"></div>
+
+        <label class="hint" style="display:block;margin-top:12px">检出深度</label>
+        <select id="coDepth" style="margin:6px 0 0">
+          <option value="immediates">只拉当前层（推荐，子目录留空，可后续按需展开）</option>
+          <option value="infinity">完整检出（整个目录树，仓库大时会很久）</option>
+          <option value="files">只拉当前层文件（不含任何子目录）</option>
+          <option value="empty">只建骨架（不拉任何文件）</option>
+        </select>
+
+        <div class="rowtop" style="margin-top:12px">
+          <input id="coUser" placeholder="用户名（留空用已保存凭据）" style="flex:1">
+          <input id="coPass" type="password" placeholder="密码（留空用已保存凭据）" style="flex:1">
+        </div>
+
+        <pre class="out" id="coLog" style="display:none;max-height:190px;margin-top:10px"></pre>
+      </div>
     </div>
     <div class="f">
       <button onclick="closeModal()">取消</button>
-      <button class="primary" onclick="addProject()">添加</button>
+      <button class="primary" id="btnAddOk" onclick="addProject()">添加</button>
+      <button class="primary" id="btnCoStart" onclick="startCheckout()" style="display:none">开始检出</button>
     </div>
   </div>
 </div>
@@ -1053,9 +1233,34 @@ async function renderInfo(){
   $('#body').innerHTML = `<table><tbody>${keep.filter(k=>d[k]).map(k=>
     `<tr><td style="width:150px;color:var(--muted)">${esc(k)}</td><td class="pth">${esc(d[k])}</td></tr>`).join('')}</tbody></table>`;
 }
-/* ── 添加项目 ── */
-function openAdd(){ $('#mask').classList.add('on'); $('#newpath').focus(); }
-function closeModal(){ $('#mask').classList.remove('on'); $('#browse').style.display='none'; }
+/* ── 添加项目 / 从服务器检出 ── */
+let addTab = 'exist';
+let coTaskId = null;
+
+function openAdd(){
+  $('#mask').classList.add('on');
+  setAddTab('exist');
+  setTimeout(()=>{ try{ $('#newpath').focus(); }catch(e){} }, 50);
+}
+function setAddTab(t){
+  addTab = t;
+  $('#paneExist').style.display  = t==='exist'    ? 'block' : 'none';
+  $('#paneCo').style.display     = t==='checkout' ? 'block' : 'none';
+  $('#btnAddOk').style.display   = t==='exist'    ? '' : 'none';
+  $('#btnCoStart').style.display = t==='checkout' ? '' : 'none';
+  $('#segExist').classList.toggle('on', t==='exist');
+  $('#segCo').classList.toggle('on', t==='checkout');
+}
+async function closeModal(){
+  if(coTaskId){
+    if(!confirm('检出还在进行中，确定取消吗？')) return;
+    await api('/api/checkout/cancel', {id: coTaskId});
+    coTaskId = null;
+  }
+  $('#mask').classList.remove('on');
+  $('#browse').style.display='none';
+  $('#coBrowse').style.display='none';
+}
 async function addProject(){
   const path = $('#newpath').value.trim();
   const name = $('#newname').value.trim();
@@ -1066,20 +1271,90 @@ async function addProject(){
   toast('✓ 已添加：'+d.name);
   await refreshAll(); selectProject(d.name);
 }
-async function browse(path){
+
+/* 目录浏览：target 决定把路径写进哪个输入框 */
+async function browse(path, target){
+  target = target || 'newpath';
+  const isCo = target === 'coPath';
   const d = await api('/api/fs?path='+encodeURIComponent(path||'~'));
   if(d.error) return toast(d.error);
-  $('#crumb').textContent = d.path;
-  const box = $('#browse'); box.style.display='block';
+  $(isCo ? '#coCrumb' : '#crumb').textContent = d.path;
+  const box = $(isCo ? '#coBrowse' : '#browse');
+  box.style.display = 'block';
+  const q = s => String(s).replace(/\\/g,'/').replace(/'/g,"\\'");
   let h = '';
-  if(d.parent) h += `<div class="bi" onclick="browse('${d.parent.replace(/'/g,"\\'")}')">⬆︎ 上级目录</div>`;
-  if(d.is_wc) h += `<div class="bi wc" onclick="useWC('${d.path.replace(/'/g,"\\'")}')">✓ 使用当前目录（这里有 .svn）</div>`;
-  h += d.dirs.map(x=>`<div class="bi ${x.is_wc?'wc':''}" onclick="browse('${x.path.replace(/'/g,"\\'")}')">
+  if(d.parent) h += `<div class="bi" onclick="browse('${q(d.parent)}','${target}')">⬆︎ 上级目录</div>`;
+  h += `<div class="bi wc" onclick="useWC('${q(d.path)}','${target}')">✓ 使用当前目录${(!isCo && d.is_wc) ? '（这里有 .svn）' : ''}</div>`;
+  h += d.dirs.map(x=>`<div class="bi ${x.is_wc?'wc':''}" onclick="browse('${q(x.path)}','${target}')">
       ${x.is_wc?'📦':'📁'} ${esc(x.name)}${x.is_wc?' <span class="hint">SVN 工作副本</span>':''}</div>`).join('');
-  if(!d.dirs.length && !d.is_wc) h += '<div class="bi" style="color:var(--muted)">（没有子目录）</div>';
+  if(!d.dirs.length) h += '<div class="bi" style="color:var(--muted)">（没有子目录）</div>';
   box.innerHTML = h;
 }
-function useWC(p){ $('#newpath').value = p; $('#browse').style.display='none'; }
+function useWC(p, target){
+  target = target || 'newpath';
+  $('#'+target).value = p;
+  $(target==='coPath' ? '#coBrowse' : '#browse').style.display='none';
+}
+
+/* 检出：启动后轮询进度 */
+async function startCheckout(){
+  const url  = $('#coUrl').value.trim();
+  const path = $('#coPath').value.trim();
+  if(!url)  return toast('请填写 SVN 地址');
+  if(!path) return toast('请填写保存路径');
+  const log = $('#coLog');
+  log.style.display = 'block';
+  log.textContent = '正在启动检出…';
+  $('#btnCoStart').disabled = true;
+  const d = await api('/api/checkout', {
+    url, path,
+    depth: $('#coDepth').value,
+    username: $('#coUser').value.trim(),
+    password: $('#coPass').value
+  });
+  if(!d.ok){
+    log.textContent = '✗ ' + (d.error || '启动失败');
+    $('#btnCoStart').disabled = false;
+    return;
+  }
+  coTaskId = d.id;
+  pollCheckout();
+}
+async function pollCheckout(){
+  if(!coTaskId) return;
+  const t = await api('/api/checkout/status?id='+coTaskId);
+  const log = $('#coLog');
+  if(t.error){
+    log.textContent = '✗ ' + t.error;
+    $('#btnCoStart').disabled = false;
+    coTaskId = null;
+    return;
+  }
+  const lines = (t.lines||[]).slice(-14);
+  if(t.status === 'running'){
+    log.textContent = lines.join('\n') + '\n\n… 已处理 ' + (t.count||0) + ' 项';
+    log.scrollTop = log.scrollHeight;
+    setTimeout(pollCheckout, 1200);
+    return;
+  }
+  $('#btnCoStart').disabled = false;
+  if(t.status === 'done'){
+    log.textContent = '✓ 检出完成，已添加项目「' + t.project + '」';
+    const pj = t.project;
+    coTaskId = null;
+    setTimeout(async ()=>{
+      $('#mask').classList.remove('on');
+      await refreshAll();
+      selectProject(pj);
+    }, 1000);
+  } else if(t.status === 'cancelled'){
+    log.textContent = '已取消检出';
+    coTaskId = null;
+  } else {
+    log.textContent = '✗ ' + (t.error || '检出失败') + '\n\n' + lines.slice(-8).join('\n');
+    coTaskId = null;
+  }
+}
 
 /* init */
 (async () => {
@@ -1087,6 +1362,13 @@ function useWC(p){ $('#newpath').value = p; $('#browse').style.display='none'; }
   const want = new URLSearchParams(location.search).get('p');
   if (want && S.projects.some(x => x.name === want)) selectProject(want);
   else if (S.projects.length) selectProject(S.projects[0].name);
+
+  // 支持 #checkout / #add 直接打开添加弹窗
+  const hash = location.hash.replace('#', '');
+  if (hash === 'checkout' || hash === 'add') {
+    openAdd();
+    setAddTab(hash === 'checkout' ? 'checkout' : 'exist');
+  }
 })();
 setInterval(()=>{ if(S.cur && S.tab==='changes' && !document.querySelector('#msg')?.matches(':focus')) loadStatus(); }, 30000);
 </script>
