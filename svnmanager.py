@@ -311,9 +311,18 @@ def _checkout_worker(tid, url, path, name, username, password, depth, mode="chec
         else:
             raw = "\n".join(lines[-40:])
             hint = diagnose(path, raw) or "下载没成功，具体原因见下面的原始信息。"
+            # 即使失败/中断，只要已经下出了一份有效的工作副本，也要加进列表，
+            # 否则用户下了半天，左侧却什么都没有
+            registered = ""
+            rc_i, u_i, _ = svn(["info", "--show-item", "url"], cwd=path, timeout=30)
+            if rc_i == 0 and (u_i or "").strip():
+                ok_i, res_i = register_project(path, name)
+                if ok_i:
+                    registered = res_i
             _task_update(tid, status="error", returncode=proc.returncode,
                          error="下载失败 —— " + hint,
-                         hint=hint, raw=raw, lines=lines[-60:])
+                         hint=hint, raw=raw, lines=lines[-60:],
+                         project=registered)
     except Exception as e:
         _task_update(tid, status="error",
                      error="下载过程中出了意外：%s" % e, lines=lines[-40:])
@@ -949,6 +958,8 @@ pre.diff .add{color:var(--green)}
 pre.diff .del{color:var(--red)}
 pre.diff .hunk{color:var(--accent)}
 .errmsg{color:var(--red);font-weight:600;font-size:12.5px;line-height:1.65;white-space:pre-wrap}
+.oknote{margin-top:8px;padding:8px 10px;border-radius:8px;background:rgba(40,167,69,.13);
+  color:var(--green);font-size:12px;line-height:1.6;font-weight:500}
 #coLog details summary{cursor:pointer;margin-top:8px;outline:none}
 .loading{opacity:.5;pointer-events:none}
 </style>
@@ -1417,10 +1428,17 @@ async function pollCheckout(){
     coTaskId = null;
   } else {
     const raw = t.raw || lines.join('\n');
-    log.innerHTML = '<div class="errmsg">' + esc(t.error || '下载失败') + '</div>'
-      + (raw ? '<details><summary class="hint">原始信息（技术细节）</summary>'
-             + '<pre class="out" style="max-height:150px;overflow:auto;margin-top:6px">'
-             + esc(raw) + '</pre></details>' : '');
+    let html = '<div class="errmsg">' + esc(t.error || '下载失败') + '</div>';
+    if(t.project){
+      html += '<div class="oknote">已经下到本地的内容，已经加到左边的项目列表里了（名字：'
+            + esc(t.project) + '）。再点一次「开始下载」会接着把剩下的下完。</div>';
+    }
+    if(raw){
+      html += '<details><summary class="hint">原始信息（技术细节）</summary>'
+            + '<pre class="out" style="max-height:150px;overflow:auto;margin-top:6px">'
+            + esc(raw) + '</pre></details>';
+    }
+    log.innerHTML = html;
     coTaskId = null;
   }
 }
