@@ -1,5 +1,5 @@
 #!/bin/bash
-# SVN Manager 启动器
+# SVN Manager 启动器 —— 单窗口：已有窗口时只激活，不重复打开
 PORT=8765
 URL="http://127.0.0.1:${PORT}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -7,39 +7,55 @@ RES="$(cd "$HERE/../Resources" && pwd)"
 PYFILE="$RES/svnmanager.py"
 LOG="/tmp/svnmanager.log"
 
+# 激活已存在的 SVN Manager 窗口并刷新页面；成功返回 0
+focus_existing() {
+  /usr/bin/pgrep -x "Google Chrome" >/dev/null 2>&1 || return 1
+  local hit
+  hit="$(/usr/bin/osascript -e 'tell application "Google Chrome"
+    repeat with w in (every window)
+      if (name of w) is "SVN Manager" then
+        set index of w to 1
+        activate
+        try
+          tell active tab of w to reload
+        end try
+        return "yes"
+      end if
+    end repeat
+    return "no"
+  end tell' 2>/dev/null)"
+  [ "$hit" = "yes" ]
+}
+
 open_window() {
   if [ -d "/Applications/Google Chrome.app" ]; then
-    open -na "Google Chrome" --args --app="${URL}" --window-size=1380,880
+    /usr/bin/open -na "Google Chrome" --args --app="${URL}" --window-size=1380,880
   else
-    open "${URL}"
+    /usr/bin/open "${URL}"
   fi
 }
 
-# 已经在运行 → 直接开窗口
-if /usr/bin/curl -s -o /dev/null --max-time 1 "${URL}/api/projects"; then
-  open_window
+# 1) 先确保服务在跑
+if ! /usr/bin/curl -s -o /dev/null --max-time 1 "${URL}/api/projects"; then
+  PY=""
+  for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    if [ -x "$c" ]; then PY="$c"; break; fi
+  done
+  if [ -z "$PY" ]; then
+    /usr/bin/osascript -e 'display alert "缺少 Python 3" message "SVN Manager 需要 Python 3 才能运行。"'
+    exit 1
+  fi
+  nohup "$PY" "$PYFILE" --port "${PORT}" --no-browser >>"${LOG}" 2>&1 &
+  for _ in $(seq 1 60); do
+    if /usr/bin/curl -s -o /dev/null --max-time 1 "${URL}/api/projects"; then break; fi
+    sleep 0.2
+  done
+fi
+
+# 2) 已有窗口就只激活 + 刷新，绝不再开第二个
+if focus_existing; then
   exit 0
 fi
 
-# 找一个可用的 Python 3
-PY=""
-for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-  if [ -x "$c" ]; then PY="$c"; break; fi
-done
-
-if [ -z "$PY" ]; then
-  /usr/bin/osascript -e 'display alert "缺少 Python 3" message "SVN Manager 需要 Python 3 才能运行。"'
-  exit 1
-fi
-
-nohup "$PY" "$PYFILE" --port "${PORT}" --no-browser >>"${LOG}" 2>&1 &
-
-# 等服务就绪（最多 12 秒）
-for _ in $(seq 1 60); do
-  if /usr/bin/curl -s -o /dev/null --max-time 1 "${URL}/api/projects"; then
-    break
-  fi
-  sleep 0.2
-done
-
+# 3) 没有窗口才新建
 open_window
