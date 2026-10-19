@@ -171,9 +171,16 @@ def register_project(path, name=""):
     if not os.path.isdir(os.path.join(path, ".svn")):
         return False, "这个目录不是 SVN 工作副本（没有 .svn）"
     path = os.path.realpath(path)
+    d = load_conf()
+    # 同一个路径已经注册过 → 直接返回，避免重复添加
+    for x in d["projects"]:
+        try:
+            if os.path.realpath(x["path"]) == path:
+                return True, x["name"]
+        except OSError:
+            continue
     if not name:
         name = os.path.basename(path.rstrip("/\\")) or "project"
-    d = load_conf()
     if any(x["name"] == name for x in d["projects"]):
         i = 2
         while any(x["name"] == "%s-%d" % (name, i) for x in d["projects"]):
@@ -191,6 +198,36 @@ TASK_LOCK = threading.Lock()
 
 DEPTHS = ("infinity", "immediates", "files", "empty")
 
+# svn 错误码 → 人话
+ERR_HINTS = [
+    ("E155037", "上次下载没做完就被中断了，文件夹被锁住。再点一次「开始检出」会自动清理并接着下。"),
+    ("E155004", "文件夹被锁住了（可能上次操作没做完）。再点一次「开始检出」会自动清理。"),
+    ("E170013", "连不上 SVN 服务器。检查一下网络，或者地址里的主机名有没有写错。"),
+    ("E210005", "服务器上没有这个仓库。地址里的仓库名可能写错了。"),
+    ("E170001", "账号或密码不对，也可能是这个账号没有这个项目的权限。"),
+    ("E215004", "这个地址需要登录才能访问，请把用户名和密码填上。"),
+    ("E175002", "服务器拒绝了请求，或者网络中途断了。"),
+    ("E670002", "网络中途断开了，检查一下网络再试。"),
+    ("E730054", "没有权限写到这个文件夹。换一个你有权限的位置，比如桌面或文稿。"),
+    ("E000111", "磁盘空间不够了。清理一下再试。"),
+    ("E200030", "文件被别的程序占用着，关掉正在用它的软件再试。"),
+]
+
+
+def diagnose(path, text):
+    """把 svn 的原始报错翻译成普通人能看懂的一句话"""
+    t = (text or "").lower()
+    for code, hint in ERR_HINTS:
+        if code.lower() in t:
+            return hint
+    if "locked" in t or "锁" in t:
+        return "文件夹被锁住了，再点一次「开始检出」会自动清理。"
+    if not t.strip():
+        return "下载中途被中断了（可能是关掉了窗口或网络断了）。再点一次「开始检出」会接着下。"
+    if os.path.isdir(os.path.join(path, ".svn")):
+        return "目标文件夹里已经有上次没下完的内容。再点一次「开始检出」会接着下。"
+    return ""
+
 
 def _task_update(tid, **kw):
     with TASK_LOCK:
@@ -205,24 +242,33 @@ def get_task(tid):
         return dict(t) if t else None
 
 
-def start_checkout(url, path, name="", username="", password="", depth="infinity"):
+def start_checkout(url, path, name="", username="", password="", depth="infinity", mode="checkout"):
     tid = uuid.uuid4().hex[:10]
     with TASK_LOCK:
         CHECKOUT_TASKS[tid] = {
             "id": tid, "status": "running", "url": url, "path": path,
-            "name": name, "count": 0, "lines": [], "error": "",
-            "started": time.time(), "returncode": None, "project": "",
+            "name": name, "count": 0, "lines": [], "error": "", "hint": "",
+            "mode": mode, "started": time.time(), "returncode": None, "project": "",
         }
     threading.Thread(
         target=_checkout_worker,
-        args=(tid, url, path, name, username, password, depth),
+        args=(tid, url, path, name, username, password, depth, mode),
         daemon=True,
     ).start()
     return tid
 
 
-def _checkout_worker(tid, url, path, name, username, password, depth):
-    args = ["checkout", "--non-interactive", "--depth", depth, url, path]
+def _checkout_worker(tid, url, path, name, username, password, depth, mode="checkout"):
+    # 目标已经是工作副本（上次没下完）→ 先清锁，否则任何操作都会 E155037
+    already_wc = os.path.isdir(os.path.join(path, ".svn"))
+    if already_wc:
+        _task_update(tid, lines=["正在清理上次没下完留下的锁…"])
+        svn(["cleanup", "--non-interactive"], cwd=path, timeout=1800)
+
+    if mode == "update":
+        args = ["update", "--non-interactive", "--accept", "postpone", path]
+    else:
+        args = ["checkout", "--non-interactive", "--depth", depth, url, path]
     if username:
         args += ["--username", username]
     if password:
@@ -260,14 +306,17 @@ def _checkout_worker(tid, url, path, name, username, password, depth):
                              returncode=0, lines=lines[-40:])
             else:
                 _task_update(tid, status="error", returncode=0,
-                             error="检出成功，但注册项目失败：" + res,
+                             error="下载完成了，但加入项目列表失败：%s" % res,
                              lines=lines[-40:])
         else:
+            raw = "\n".join(lines[-40:])
+            hint = diagnose(path, raw) or "下载没成功，具体原因见下面的原始信息。"
             _task_update(tid, status="error", returncode=proc.returncode,
-                         error="svn 退出码 %d" % proc.returncode,
-                         lines=lines[-60:])
+                         error="下载失败 —— " + hint,
+                         hint=hint, raw=raw, lines=lines[-60:])
     except Exception as e:
-        _task_update(tid, status="error", error=str(e), lines=lines[-40:])
+        _task_update(tid, status="error",
+                     error="下载过程中出了意外：%s" % e, lines=lines[-40:])
 
 
 def safe_join(root, rel):
@@ -652,22 +701,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "请填写 SVN 地址"})
             if not path:
                 return self._json({"ok": False, "error": "请填写保存路径"})
-            if os.path.exists(path):
+            mode = "checkout"
+            wc = os.path.isdir(os.path.join(path, ".svn"))
+            if wc:
+                # 已经是工作副本：同一项目就清理后接着下，别的项目就拒绝
+                _, cur_url, _ = svn(["info", "--show-item", "url"], cwd=path, timeout=30)
+                cur_url = (cur_url or "").strip()
+                if cur_url and cur_url.rstrip("/") != url.rstrip("/"):
+                    return self._json({"ok": False, "error":
+                        "这个文件夹里已经是另一个项目的副本（%s）。\n请换个文件夹，或者先把那个副本挪走。" % cur_url})
+                mode = "update"
+            elif os.path.exists(path):
                 if not os.path.isdir(path):
-                    return self._json({"ok": False, "error": "目标路径已存在且不是目录"})
+                    return self._json({"ok": False, "error": "这个路径已经是一个文件了，请换一个文件夹"})
                 try:
                     if os.listdir(path):
-                        return self._json({"ok": False,
-                                           "error": "目标目录不为空，请换一个空目录或新路径"})
+                        return self._json({"ok": False, "error":
+                            "文件夹里已经有别的东西了，请换一个空文件夹。"})
                 except OSError as e:
-                    return self._json({"ok": False, "error": "无法读取目标目录：%s" % e})
+                    return self._json({"ok": False, "error": "无法读取这个文件夹：%s" % e})
             else:
                 parent = os.path.dirname(os.path.abspath(path))
                 if not os.path.isdir(parent):
-                    return self._json({"ok": False, "error": "上级目录不存在：%s" % parent})
+                    return self._json({"ok": False, "error": "上一级文件夹不存在：%s" % parent})
             tid = start_checkout(url, path, name,
-                                 b.get("username") or "", b.get("password") or "", depth)
-            return self._json({"ok": True, "id": tid})
+                                 b.get("username") or "", b.get("password") or "",
+                                 depth, mode)
+            return self._json({"ok": True, "id": tid, "mode": mode})
 
         if p == "/api/checkout/cancel":
             tid = b.get("id") or ""
@@ -888,6 +948,8 @@ pre.diff{padding:0}
 pre.diff .add{color:var(--green)}
 pre.diff .del{color:var(--red)}
 pre.diff .hunk{color:var(--accent)}
+.errmsg{color:var(--red);font-weight:600;font-size:12.5px;line-height:1.65;white-space:pre-wrap}
+#coLog details summary{cursor:pointer;margin-top:8px;outline:none}
 .loading{opacity:.5;pointer-events:none}
 </style>
 </head>
@@ -943,12 +1005,12 @@ pre.diff .hunk{color:var(--accent)}
   <div class="modal">
     <h3>添加 SVN 项目</h3>
     <div class="seg">
-      <button class="segbtn on" id="segExist" onclick="setAddTab('exist')">已有工作副本</button>
-      <button class="segbtn" id="segCo" onclick="setAddTab('checkout')">从服务器检出</button>
+      <button class="segbtn on" id="segExist" onclick="setAddTab('exist')">本机已有的项目</button>
+      <button class="segbtn" id="segCo" onclick="setAddTab('checkout')">从服务器下载</button>
     </div>
     <div class="c">
       <div id="paneExist">
-        <label class="hint">项目路径（必须是已有 .svn 的工作副本目录）</label>
+        <label class="hint">项目文件夹（选你电脑上已经在用的那个 SVN 文件夹）</label>
         <input id="newpath" placeholder="/Users/you/Desktop/项目名" style="margin:6px 0 8px">
         <label class="hint">显示名称（留空则用目录名）</label>
         <input id="newname" placeholder="例如 newSVN" style="margin:6px 0 10px">
@@ -960,7 +1022,7 @@ pre.diff .hunk{color:var(--accent)}
       </div>
 
       <div id="paneCo" style="display:none">
-        <label class="hint">SVN 地址</label>
+        <label class="hint">SVN 地址（问同事要，或者从别的电脑上的仓库信息里复制）</label>
         <input id="coUrl" placeholder="svn://svn.example.com/repo/项目名" style="margin:6px 0 8px">
         <label class="hint">保存到（目录必须为空或不存在）</label>
         <input id="coPath" placeholder="/Users/you/Desktop/项目名" style="margin:6px 0 6px">
@@ -970,12 +1032,12 @@ pre.diff .hunk{color:var(--accent)}
         </div>
         <div class="browse" id="coBrowse" style="display:none"></div>
 
-        <label class="hint" style="display:block;margin-top:12px">检出深度</label>
+        <label class="hint" style="display:block;margin-top:12px">下载多少内容</label>
         <select id="coDepth" style="margin:6px 0 0">
-          <option value="immediates">只拉当前层（推荐，子目录留空，可后续按需展开）</option>
-          <option value="infinity">完整检出（整个目录树，仓库大时会很久）</option>
-          <option value="files">只拉当前层文件（不含任何子目录）</option>
-          <option value="empty">只建骨架（不拉任何文件）</option>
+          <option value="immediates">只下这一层（推荐，里面的子文件夹先留空）</option>
+          <option value="infinity">全部下载（整个文件夹树，仓库大时会很久）</option>
+          <option value="files">只要这一层的文件（不要子文件夹）</option>
+          <option value="empty">只建空的文件夹结构（不下载任何文件）</option>
         </select>
 
         <div class="rowtop" style="margin-top:12px">
@@ -989,7 +1051,7 @@ pre.diff .hunk{color:var(--accent)}
     <div class="f">
       <button onclick="closeModal()">取消</button>
       <button class="primary" id="btnAddOk" onclick="addProject()">添加</button>
-      <button class="primary" id="btnCoStart" onclick="startCheckout()" style="display:none">开始检出</button>
+      <button class="primary" id="btnCoStart" onclick="startCheckout()" style="display:none">开始下载</button>
     </div>
   </div>
 </div>
@@ -1253,7 +1315,7 @@ function setAddTab(t){
 }
 async function closeModal(){
   if(coTaskId){
-    if(!confirm('检出还在进行中，确定取消吗？')) return;
+    if(!confirm('还在下载中，现在关掉会中断下载。确定要取消吗？')) return;
     await api('/api/checkout/cancel', {id: coTaskId});
     coTaskId = null;
   }
@@ -1304,7 +1366,7 @@ async function startCheckout(){
   if(!path) return toast('请填写保存路径');
   const log = $('#coLog');
   log.style.display = 'block';
-  log.textContent = '正在启动检出…';
+  log.textContent = '正在开始下载…';
   $('#btnCoStart').disabled = true;
   const d = await api('/api/checkout', {
     url, path,
@@ -1313,9 +1375,12 @@ async function startCheckout(){
     password: $('#coPass').value
   });
   if(!d.ok){
-    log.textContent = '✗ ' + (d.error || '启动失败');
+    log.innerHTML = '<div class="errmsg">' + esc(d.error || '启动失败') + '</div>';
     $('#btnCoStart').disabled = false;
     return;
+  }
+  if(d.mode === 'update'){
+    log.textContent = '发现这个文件夹里已经有上次没下完的内容，正在清理并接着下载…';
   }
   coTaskId = d.id;
   pollCheckout();
@@ -1332,7 +1397,7 @@ async function pollCheckout(){
   }
   const lines = (t.lines||[]).slice(-14);
   if(t.status === 'running'){
-    log.textContent = lines.join('\n') + '\n\n… 已处理 ' + (t.count||0) + ' 项';
+    log.textContent = lines.join('\n') + '\n\n… 已经下载 ' + (t.count||0) + ' 个文件';
     log.scrollTop = log.scrollHeight;
     setTimeout(pollCheckout, 1200);
     return;
@@ -1348,10 +1413,14 @@ async function pollCheckout(){
       selectProject(pj);
     }, 1000);
   } else if(t.status === 'cancelled'){
-    log.textContent = '已取消检出';
+    log.textContent = '已取消下载';
     coTaskId = null;
   } else {
-    log.textContent = '✗ ' + (t.error || '检出失败') + '\n\n' + lines.slice(-8).join('\n');
+    const raw = t.raw || lines.join('\n');
+    log.innerHTML = '<div class="errmsg">' + esc(t.error || '下载失败') + '</div>'
+      + (raw ? '<details><summary class="hint">原始信息（技术细节）</summary>'
+             + '<pre class="out" style="max-height:150px;overflow:auto;margin-top:6px">'
+             + esc(raw) + '</pre></details>' : '');
     coTaskId = null;
   }
 }
