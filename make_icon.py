@@ -39,4 +39,11 @@ for x, y in nodes:
     d.ellipse([x - r, y - r, x + r, y + r], fill="white")
 
 img.save("/tmp/svnicon_1024.png")
-print("ok")
+print("已生成 /tmp/svnicon_1024.png")
+
+# 顺便生成 Windows 用的 .ico（多尺寸）
+import os
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "AppIcon.ico")
+os.makedirs(os.path.dirname(out), exist_ok=True)
+img.save(out, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+print("已生成", out)

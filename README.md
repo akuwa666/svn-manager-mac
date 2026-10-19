@@ -1,16 +1,16 @@
 # SVN Manager
 
-一个免费的、macOS 上的多项目 Subversion 图形客户端。
+一个免费的多项目 Subversion 图形客户端，支持 **macOS** 和 **Windows**。
 
 ![界面截图](assets/screenshot.png)
 
 ## 为什么做这个
 
-macOS 上最好用的 SVN 客户端是 [SnailSVN](https://apps.apple.com/cn/app/id1063090543)，它和访达（Finder）深度集成，右键就能提交。
+macOS 上最好用的 SVN 客户端是 [SnailSVN](https://apps.apple.com/cn/app/id1063090543)，它和访达深度集成，右键就能提交。但**免费的精简版只支持一个工作副本**，同机管理多个项目就得反复换路径。
 
-但**免费的精简版只支持一个工作副本**。同一台机器上管理多个 SVN 项目，就得反复在偏好设置里换路径，或者买专业版。
+Windows 上有 TortoiseSVN，功能很全，但它是**按文件夹**工作的——你有 5 个项目，就得开 5 个资源管理器窗口，挨个右键看有没有改动。
 
-而 macOS 上完全没有其它免费的替代品：
+macOS 上也几乎没有免费的替代品：
 
 | 工具 | 支持多项目 | 免费 | 现状 |
 |---|---|---|---|
@@ -19,16 +19,14 @@ macOS 上最好用的 SVN 客户端是 [SnailSVN](https://apps.apple.com/cn/app/
 | SmartSVN | ✅ | ❌ | 14.3 起商业用途必须付费 |
 | svnX | ✅ | ✅ | 开源，但 2016 年后没更新，新系统跑不起来 |
 | Cornerstone / Versions | ✅ | ❌ | 付费 |
-| TortoiseSVN | — | — | 只有 Windows 版 |
+| TortoiseSVN | — | ✅ | 只有 Windows，且按文件夹工作 |
 
-GitHub 上搜到的几个「macOS SVN 客户端」基本都是没有可运行发布物的空壳仓库。
-
-所以这里是一个能用的：**零依赖、单文件、调用系统 `svn` 命令行**的图形界面。
+所以这里做一个「**把所有项目汇总到一个看板**」的东西：左侧多个项目，右侧一张表，列出所有项目待提交的改动，按修改时间从新到旧排。
 
 ## 功能
 
 - **多项目侧栏**，项目数量无限制，每个显示当前版本号和改动数
-- **改动列表**：状态徽章（`C` 冲突 / `M` 修改 / `A` 新增 / `D` 删除 / `?` 未纳管 / `!` 缺失），逐文件查看差异、定位到访达
+- **改动列表**：状态徽章（`C` 冲突 / `M` 修改 / `A` 新增 / `D` 删除 / `?` 未纳管 / `!` 缺失），逐文件查看差异、定位到文件管理器
 - **修改时间列**：显示每个文件的本地修改时间（「3 小时前」「09-15」这种），整张列表按修改时间从新到旧排，一眼看出哪些是最近改的；冲突和缺失仍置顶，避免被淹没
 - **勾选 + 写提交信息 → 提交**，未纳管文件可自动 `svn add`
 - **删除**：已纳管的走 `svn delete`（标记为 `D`，可撤销、可提交），未纳管的直接移除文件；支持单行删除和批量删除
@@ -36,10 +34,13 @@ GitHub 上搜到的几个「macOS SVN 客户端」基本都是没有可运行发
 - **详情**：仓库 URL、UUID、最后修改者、最后修改版本
 - **一键更新 / 清理（cleanup）**
 - 跟随系统深色 / 浅色模式
+- 单窗口：重复打开只会激活已有窗口，不会堆一堆
 
 ## 安装
 
-需要 macOS + 已经装好 `svn` 命令行：
+### macOS
+
+需要已经装好 `svn` 命令行：
 
 ```bash
 brew install subversion
@@ -55,17 +56,36 @@ cd svn-manager-mac
 
 装到 `~/Applications/SVN Manager.app`，双击即可打开。
 
-> 也可以用 `python3 svnmanager.py` 直接跑，不用装 App。
+### Windows
+
+需要三样东西：
+
+1. **Python 3.8+** — https://www.python.org/downloads/windows/
+   安装时**必须勾选 `Add Python to PATH`**
+2. **Subversion 命令行工具**，二选一：
+   - 已装 TortoiseSVN 的：重新运行安装包，勾选 **`command line client tools`**（默认是不装的，这是最常见的问题）
+   - 或者单独装 [SlikSVN](https://sliksvn.com/download/)
+3. **Chrome 或 Edge**（用于无地址栏的窗口；都没有则用默认浏览器）
+
+然后：
+
+```bash
+git clone https://github.com/akuwa666/svn-manager-mac.git
+```
+
+右键 `windows\install.ps1` → **使用 PowerShell 运行**，它会在桌面创建带图标的快捷方式。
+
+也可以直接双击 `windows\SVN Manager.bat` 使用。
 
 ## 使用
 
-1. 双击打开，左下角 **＋ 添加项目**
+1. 打开应用，左下角 **＋ 添加项目**
 2. 点 **浏览…** 选目录，认到 `.svn` 的那一层会标绿
 3. 左侧切换项目，右侧勾选要提交的文件，写提交信息，点 **提交选中**
 
-> 重复双击不会开出一堆窗口：已有窗口时只会激活并刷新它。服务挂掉时双击会顺带把服务拉起来。
+> 重复打开不会开出一堆窗口：已有窗口时只会激活并刷新它。服务挂掉时再打开会顺带把服务拉起来。
 
-项目列表存在 `~/.svnmanager.json`，可以直接编辑：
+项目列表存在 `~/.svnmanager.json`（Windows 是 `C:\Users\你的用户名\.svnmanager.json`），可以直接编辑：
 
 ```json
 {
@@ -78,14 +98,16 @@ cd svn-manager-mac
 
 ## 工作原理
 
-一个单文件 Python 程序（只用标准库）：
+一个单文件 Python 程序，只用标准库：
 
 - 起一个只监听 `127.0.0.1:8765` 的 HTTP 服务
 - 对内嵌的单页前端提供 JSON 接口
-- 每个操作都转成一条 `svn` 命令（`status` / `update` / `commit` / `log` / `diff` / `cleanup` / `resolve`）
-- 用 Chrome 的 `--app` 模式打开，没有地址栏，观感接近原生窗口
+- 每个操作都转成一条 `svn` 命令（`status` / `update` / `commit` / `log` / `diff` / `delete` / `cleanup`）
+- 用浏览器/Chrome 的 `--app` 模式打开，没有地址栏，观感接近原生窗口
 
-因为核心就是调用命令行 `svn`，所以任何 `svn` 能做的事它都能做，认证、`svn://`、`svn+ssh://`、`http(s)://` 全都沿用系统的凭据缓存。
+状态读取用 `svn status --xml` 而不是文本输出——XML 声明自带编码，中文路径在 Windows 上不会乱码。
+
+因为核心就是调用命令行 `svn`，所以任何 `svn` 能做的事它都能做，认证、`svn://`、`svn+ssh://`、`http(s)://` 全都沿用系统已有的凭据缓存。
 
 ## 常见问题
 
@@ -93,16 +115,16 @@ cd svn-manager-mac
 不会。所有写操作都是标准的 `svn commit` / `svn update`，`svn update` 用 `--accept postpone`，遇到冲突会停下来而不是替你选。
 
 **Q：出现「树冲突：本地目录删除，incoming dir delete」怎么办？**
-这通常是因为在访达里直接删了 SVN 管理的目录，而服务器上也删了。两边目标一致，直接：
+这通常是因为在文件管理器里直接删了 SVN 管理的目录，而服务器上也删了。两边目标一致，直接：
 
 ```bash
 svn resolve --accept working <路径>
 ```
 
-**Q：`svn status` 显示 `!` 缺失 / `C` 冲突，能在这里处理吗？**
-能看状态和差异，但解决冲突目前建议用命令行。`svn resolve --accept working` 是"保留我本地状态"的通用解法。
+**Q：Windows 上报「找不到 svn 命令」？**
+TortoiseSVN 默认**不安装**命令行工具。重新运行它，勾选 `command line client tools`。
 
-**Q：为什么不是访达扩展（没有图标角标和右键菜单）？**
+**Q：为什么不是文件管理器扩展（没有图标角标和右键菜单）？**
 访达扩展（Finder Sync Extension）需要 Xcode 开发和代码签名，个人分发基本跑不起来。这个工具走的是独立窗口路线。
 
 **Q：端口被占用 / 打不开？**
@@ -113,7 +135,8 @@ svn resolve --accept working <路径>
 - 没有 `blame`、`merge`、分支切换
 - 差异查看只对文本文件有意义（二进制文件只会显示一行提示）
 - 冲突解决需要命令行（`svn resolve`），界面里只能看状态和差异
-- 修改时间取自本地文件的 mtime，**执行 `svn update` 后，被服务器更新的文件 mtime 会变成更新时间**，这时「最近修改」反映的是"最近被更新"而不是"我最近编辑过"
+- 修改时间取自本地文件的 mtime，**执行「更新」后，被服务器更新的文件 mtime 会变成更新时间**，这时「最近修改」反映的是"最近被更新"而不是"我最近编辑过"
+- **Windows 部分尚未在真实 Windows 机器上运行验证**：代码已做跨平台处理（svn 路径探测、编码、资源管理器定位、pythonw 无 stdout 等），macOS 侧已完整回归，但 Windows 启动脚本仍属未实测状态。遇到问题请开 issue。
 
 ## License
 

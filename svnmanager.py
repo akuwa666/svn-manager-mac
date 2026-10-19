@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import webbrowser
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -20,7 +21,12 @@ CONF = os.path.expanduser("~/.svnmanager.json")
 DEFAULT_PORT = 8765
 
 
+IS_WIN = os.name == "nt"
+
+
 def _pick_locale():
+    if IS_WIN:
+        return None  # Windows 上不设 LC_ALL，交给系统代码页
     try:
         out = subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout
     except Exception:
@@ -32,7 +38,56 @@ def _pick_locale():
 
 
 SVN_ENV = dict(os.environ)
-SVN_ENV.update({"LC_ALL": _pick_locale(), "LANG": _pick_locale()})
+_loc = _pick_locale()
+if _loc:
+    SVN_ENV.update({"LC_ALL": _loc, "LANG": _loc})
+
+
+def find_svn():
+    """定位 svn 可执行文件。Windows 上 TortoiseSVN/SlikSVN 默认不在 PATH。"""
+    for name in ("svn", "svn.exe"):
+        exe = shutil.which(name)
+        if exe:
+            return exe
+    if IS_WIN:
+        for c in (
+            r"C:\Program Files\TortoiseSVN\bin\svn.exe",
+            r"C:\Program Files (x86)\TortoiseSVN\bin\svn.exe",
+            r"C:\Program Files\SlikSvn\bin\svn.exe",
+            r"C:\Program Files (x86)\SlikSvn\bin\SlikSvn\svn.exe",
+            r"C:\Program Files (x86)\SlikSvn\bin\svn.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\TortoiseSVN\bin\svn.exe"),
+        ):
+            if os.path.exists(c):
+                return c
+    return "svn"
+
+
+SVN_BIN = find_svn()
+
+
+def sibling_bin(name):
+    """找同目录下的 svnversion 等配套命令"""
+    d = os.path.dirname(SVN_BIN)
+    fname = name + (".exe" if IS_WIN else "")
+    if d:
+        p = os.path.join(d, fname)
+        if os.path.exists(p):
+            return p
+    return fname
+
+
+def _dec(b):
+    """svn 的文本输出：Windows 走系统 ANSI 代码页，类 Unix 是 UTF-8"""
+    if isinstance(b, str):
+        return b
+    if IS_WIN:
+        try:
+            return b.decode("mbcs", "replace")
+        except LookupError:
+            return b.decode("gbk", "replace")
+    return b.decode("utf-8", "replace")
+
 
 CODE_LABEL = {
     "?": ("unversioned", "未纳管"),
@@ -48,18 +103,34 @@ CODE_LABEL = {
 }
 RANK = {"C": 0, "!": 1, "M": 2, "A": 3, "R": 4, "D": 5, "~": 6, "?": 7, "I": 8, "X": 9}
 
+# svn --xml 里的 item 属性 → 单字符状态码
+ITEM_CODE = {
+    "added": "A", "conflicted": "C", "deleted": "D", "external": "X",
+    "ignored": "I", "incomplete": "~", "missing": "!", "modified": "M",
+    "replaced": "R", "unversioned": "?", "obstructed": "~", "merged": "M",
+}
+
 
 # ─────────────────────────── svn 调用 ───────────────────────────
-def svn(args, cwd=None, timeout=180):
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WIN else 0
+
+
+def svn(args, cwd=None, timeout=180, raw=False):
+    """调用 svn。raw=True 返回原始 bytes（XML 用），否则按平台编码解码成 str。"""
     try:
         p = subprocess.run(
-            ["svn"] + args, cwd=cwd, capture_output=True, env=SVN_ENV, timeout=timeout
+            [SVN_BIN] + args, cwd=cwd, capture_output=True,
+            env=SVN_ENV, timeout=timeout, creationflags=_NO_WINDOW,
         )
-        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+        if raw:
+            return p.returncode, p.stdout, p.stderr
+        return p.returncode, _dec(p.stdout), _dec(p.stderr)
     except subprocess.TimeoutExpired:
         return 124, "", "命令超时（%ds）" % timeout
     except FileNotFoundError:
-        return 127, "", "找不到 svn 命令，请先安装 Subversion"
+        hint = ("请安装 TortoiseSVN（安装时勾选 command line client tools）或 SlikSVN"
+                if IS_WIN else "请先安装 Subversion：brew install subversion")
+        return 127, "", "找不到 svn 命令。" + hint
     except Exception as e:
         return 1, "", str(e)
 
@@ -99,30 +170,60 @@ def safe_join(root, rel):
     return p
 
 
+def reveal_path(target):
+    """在文件管理器里定位到某个文件"""
+    if IS_WIN:
+        subprocess.Popen('explorer /select,"%s"' % target.replace("/", "\\"), shell=True)
+    else:
+        subprocess.Popen(["open", "-R", target])
+
+
+def open_path(target):
+    """用文件管理器打开某个目录"""
+    if IS_WIN:
+        os.startfile(target)
+    else:
+        subprocess.Popen(["open", target])
+
+
 # ─────────────────────────── 核心操作 ───────────────────────────
 def parse_status(root):
-    rc, out, err = svn(["status"], cwd=root, timeout=300)
+    # 用 --xml：编码由 XML 声明保证（Windows 上中文路径不会乱码），结构也比文本模式稳
+    rc, out, err = svn(["status", "--xml"], cwd=root, timeout=300, raw=True)
     if rc not in (0, 1):
-        return [], err.strip() or "svn status 失败"
+        return [], _dec(err).strip() or "svn status 失败"
+    if not out or not out.strip():
+        return [], None
+    try:
+        doc = ET.fromstring(out)
+    except Exception as e:
+        return [], "解析 svn 输出失败: %s" % e
+
     items = []
-    for line in out.splitlines():
-        if len(line) < 9:
+    for entry in doc.iter("entry"):
+        rel = (entry.get("path") or "").replace("\\", "/")
+        wc = entry.find("wc-status")
+        if wc is None or not rel:
             continue
-        if line[:7].strip() == ">" or line.startswith("Summary"):
-            continue
-        code = line[0]
-        if code == " ":
-            code = line[1]          # 只有属性变化
-        tree_c = line[6] == "C"
+        item = wc.get("item") or "none"
+        props = wc.get("props") or "none"
+        # 1.14 里是 wc-status 的属性 tree-conflicted="true"；
+        # 旧版本或某些构建可能用 <tree-conflict> 子元素，两种都认
+        tree_c = ((wc.get("tree-conflicted") or "").strip() == "true"
+                  or wc.find("tree-conflict") is not None)
+
+        code = ITEM_CODE.get(item)
+        if code is None:
+            # item=normal/none 但属性有改动 → 仍算修改
+            if item in ("normal", "none") and props not in ("normal", "none", None):
+                code = "M"
+            else:
+                continue
         if tree_c:
             code = "C"
-        if code not in CODE_LABEL:
-            continue
-        rel = line[8:]
-        if not rel:
-            continue
+
         kind, label = CODE_LABEL[code]
-        full = os.path.join(root, rel)
+        full = os.path.join(root, rel.replace("/", os.sep))
         try:
             mtime = int(os.stat(full).st_mtime)
         except OSError:
@@ -144,9 +245,9 @@ def parse_status(root):
 def project_rev(root):
     """工作副本根的 svn info revision 可能是 0，用 svnversion 取真实版本"""
     try:
-        p = subprocess.run(["svnversion", root], capture_output=True,
-                           env=SVN_ENV, timeout=30)
-        s = p.stdout.decode("utf-8", "replace").strip()
+        p = subprocess.run([sibling_bin("svnversion"), root], capture_output=True,
+                           env=SVN_ENV, timeout=30, creationflags=_NO_WINDOW)
+        s = _dec(p.stdout).strip()
     except Exception:
         return "?"
     if not s or "Unversioned" in s or "exported" in s:
@@ -255,14 +356,15 @@ def do_delete(root, paths):
 
 def do_log(root, limit=30):
     # 工作副本根的 BASE rev 可能为 0，必须显式指定范围才能查到历史
+    # raw=True：XML 带 encoding 声明，必须交给 ET 解析 bytes
     rc, out, err = svn(["log", "-v", "-r", "HEAD:1", "-l", str(limit), "--xml"],
-                       cwd=root, timeout=120)
-    if rc != 0 or "<logentry" not in out:
+                       cwd=root, timeout=120, raw=True)
+    if rc != 0 or b"<logentry" not in out:
         # 离线兜底：用本地缓存的历史
-        rc, out, err = svn(["log", "-v", "-l", str(limit), "--xml"], cwd=root, timeout=120)
+        rc, out, err = svn(["log", "-v", "-l", str(limit), "--xml"],
+                           cwd=root, timeout=120, raw=True)
     if rc != 0:
         return []
-    import xml.etree.ElementTree as ET
     try:
         tree = ET.fromstring(out)
     except Exception:
@@ -477,15 +579,15 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._json({"ok": False}, 400)
             if os.path.exists(target):
-                subprocess.Popen(["open", "-R", target])
+                reveal_path(target)
             else:
-                subprocess.Popen(["open", pr["path"]])
+                open_path(pr["path"])
             return self._json({"ok": True})
 
         if p == "/api/open":
             pr = find_project(b.get("name"))
             if pr:
-                subprocess.Popen(["open", pr["path"]])
+                open_path(pr["path"])
             return self._json({"ok": True})
 
         return self._json({"error": "not found"}, 404)
@@ -514,7 +616,7 @@ HTML = r"""<!DOCTYPE html>
 }
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;font:13px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif;
+body{margin:0;font:13px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
   background:var(--bg);color:var(--fg);overflow:hidden;-webkit-font-smoothing:antialiased}
 button{font:inherit;cursor:pointer;border:none;border-radius:7px;padding:6px 12px;
   background:var(--card);color:var(--fg);border:1px solid var(--line);transition:.15s}
@@ -571,7 +673,7 @@ tr:last-child td{border-bottom:none}
 tr.row:hover{background:var(--hover)}
 tr.row.sel{background:var(--accent-soft)}
 td.cb{width:34px}
-td.pth{font-family:"SF Mono",Menlo,monospace;font-size:12px;word-break:break-all}
+td.pth{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
 td.act{width:1%;white-space:nowrap;text-align:right}
 td.tm{width:1%;white-space:nowrap;text-align:right;color:var(--muted);
   font-size:11px;font-variant-numeric:tabular-nums;padding-left:0}
@@ -580,7 +682,7 @@ td.act button:hover{background:var(--accent-soft)}
 td.act button.del{color:var(--red)}
 td.act button.del:hover{background:rgba(255,59,48,.12)}
 .badge{display:inline-block;min-width:22px;text-align:center;font-size:11px;font-weight:700;
-  padding:1px 6px;border-radius:5px;font-family:"SF Mono",Menlo,monospace}
+  padding:1px 6px;border-radius:5px;font-family:"SF Mono",Menlo,Consolas,monospace}
 .badge.lbl{font-family:inherit;font-weight:600;margin-left:6px;min-width:auto;white-space:nowrap}
 .b-M{background:rgba(255,149,0,.16);color:var(--orange)}
 .b-A{background:rgba(40,167,69,.16);color:var(--green)}
@@ -607,9 +709,9 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);cursor:po
 /* log */
 .le{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:8px}
 .le .h{display:flex;gap:10px;align-items:center;font-size:11px;color:var(--muted);margin-bottom:4px}
-.le .r{font-family:"SF Mono",Menlo,monospace;color:var(--accent);font-weight:700}
+.le .r{font-family:"SF Mono",Menlo,Consolas,monospace;color:var(--accent);font-weight:700}
 .le .m{white-space:pre-wrap;font-size:12.5px}
-.le .ps{margin-top:6px;font-family:"SF Mono",Menlo,monospace;font-size:11px;color:var(--muted)}
+.le .ps{margin-top:6px;font-family:"SF Mono",Menlo,Consolas,monospace;font-size:11px;color:var(--muted)}
 
 /* modal */
 .mask{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:50}
@@ -624,7 +726,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);cursor:po
 .bi:last-child{border-bottom:none}
 .bi:hover{background:var(--hover)}
 .bi.wc{color:var(--green);font-weight:600}
-.crumb{font-family:"SF Mono",Menlo,monospace;font-size:11px;color:var(--muted);word-break:break-all}
+.crumb{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:11px;color:var(--muted);word-break:break-all}
 
 /* toast */
 #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(80px);
@@ -634,7 +736,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);cursor:po
 
 /* output */
 pre.out{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;
-  font-family:"SF Mono",Menlo,monospace;font-size:11.5px;white-space:pre-wrap;word-break:break-all;
+  font-family:"SF Mono",Menlo,Consolas,monospace;font-size:11.5px;white-space:pre-wrap;word-break:break-all;
   max-height:60vh;overflow:auto;margin:8px 0}
 pre.diff{padding:0}
 pre.diff .add{color:var(--green)}
@@ -1001,6 +1103,12 @@ class Server(ThreadingHTTPServer):
 
 
 def main():
+    # Windows 上用 pythonw 启动时没有 stdout/stderr，print 会抛异常导致崩掉
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = sys.stdout
+
     port = DEFAULT_PORT
     no_open = False
     for i, a in enumerate(sys.argv):
