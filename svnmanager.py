@@ -1158,22 +1158,34 @@ function visibleItems(){
   const all = S.items.filter(i=>i.code!=='I' && i.code!=='X');
   return S.showUnver === false ? all.filter(i=>i.code!=='?') : all;
 }
+function unverCount(){ return S.items.filter(i=>i.code==='?').length; }
+function topBar(shown, hidden){
+  const ckAll = shown.length>0 && shown.every(i=>S.sel.has(i.path));
+  return `
+    <div class="rowtop">
+      <label class="selall"><input type="checkbox" id="ckall" ${ckAll?'checked':''} ${shown.length?'':'disabled'} onchange="toggleAll(this.checked)"> 全选</label>
+      <label class="selall" title="未纳管 = 服务器上还没有的新文件；取消勾选后此开关依然保留，可随时勾回">
+        <input type="checkbox" ${S.showUnver?'checked':''} onchange="S.showUnver=this.checked;S.sel.clear();renderStatus()"> 含未纳管
+      </label>
+      <span class="hint">共 ${shown.length} 项 · 冲突 ${shown.filter(i=>i.code==='C').length}${hidden?` · 已隐藏 ${hidden} 个未纳管`:''}</span>
+    </div>`;
+}
 function renderStatus(){
   const el = $('#body');
   const items = visibleItems();
+  const hidden = S.showUnver ? 0 : unverCount();
   if(!items.length){
-    el.innerHTML = '<div class="empty">✓ 工作副本干净，没有待提交的改动</div>';
-    $('#selhint').textContent='已选 0 项'; $('#btnCommit').disabled=true; return;
+    const msg = hidden
+      ? `已隐藏 ${hidden} 个未纳管文件 —— 勾选上方「含未纳管」即可重新显示`
+      : '✓ 工作副本干净，没有待提交的改动';
+    el.innerHTML = topBar([], hidden) + `<div class="empty">${msg}</div>`;
+    S.sel.clear();
+    const sh = $('#selhint'); if(sh) sh.textContent='已选 0 项';
+    const bc = $('#btnCommit'); if(bc) bc.disabled=true;
+    const bd = $('#btnDel'); if(bd) bd.disabled=true;
+    return;
   }
-  const hidden = S.items.filter(i=>i.code==='?').length;
-  el.innerHTML = `
-    <div class="rowtop">
-      <label class="selall"><input type="checkbox" id="ckall" onchange="toggleAll(this.checked)"> 全选</label>
-      <label class="selall" title="未纳管 = 服务器上还没有的新文件">
-        <input type="checkbox" ${S.showUnver?'checked':''} onchange="S.showUnver=this.checked;S.sel.clear();renderStatus()"> 含未纳管
-      </label>
-      <span class="hint">共 ${items.length} 项 · 冲突 ${items.filter(i=>i.code==='C').length}${(!S.showUnver&&hidden)?` · 已隐藏 ${hidden} 个未纳管`:''}</span>
-    </div>
+  el.innerHTML = topBar(items, hidden) + `
     <table>
       <thead><tr><th class="cb"></th><th style="width:140px">状态</th><th>路径</th><th style="width:92px">修改时间</th><th></th></tr></thead>
       <tbody>
