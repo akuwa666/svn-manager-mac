@@ -423,10 +423,204 @@ def project_rev(root):
     return digits or "?"
 
 
+def _looks_locked(text):
+    """判断这次失败是不是"工作副本被上次中断留下的锁挡住" """
+    t = (text or "").lower()
+    if "e155004" in t or "e155037" in t or "working copy locked" in t:
+        return True
+    if "工作副本" in t and "锁定" in t:
+        return True
+    return "locked" in t and "svn" in t
+
+
+def _cleanup(root):
+    return svn(["cleanup", "--non-interactive"], cwd=root, timeout=1800)
+
+
 def do_update(root):
     rc, out, err = svn(["update", "--non-interactive", "--accept", "postpone"],
                        cwd=root, timeout=1800)
-    return {"ok": rc == 0, "output": (out + err).strip()}
+    joined = out + err
+    if rc != 0 and _looks_locked(joined):
+        _cleanup(root)
+        rc, out, err = svn(["update", "--non-interactive", "--accept", "postpone"],
+                           cwd=root, timeout=1800)
+        joined = "（已自动清理上次中断留下的锁并重试）\n" + out + err
+    return {"ok": rc == 0, "output": joined.strip()}
+
+
+# ─────────────────── 提交：逐行进度 + 自动解堵 ───────────────────
+_ACTIONS = [
+    ("adding", "新增"), ("正在增加", "新增"),
+    ("sending", "上传"), ("正在发送", "上传"),
+    ("deleting", "删除"), ("正在删除", "删除"),
+    ("replacing", "替换"), ("正在替换", "替换"),
+    ("updating", "更新"), ("正在更新", "更新"),
+    ("restoring", "恢复"), ("restored", "恢复"), ("正在恢复", "恢复"),
+]
+
+
+def _parse_action(line):
+    """从 svn 输出行里认出「正在处理哪个文件」，用于进度"""
+    low = line.lower()
+    for key, label in _ACTIONS:
+        if low.startswith(key) and len(low) > len(key) and low[len(key)] in " \t":
+            return label, line[len(key):].strip()
+    return None, None
+
+
+def _stream_svn(args, cwd, timeout=1800, on_line=None):
+    """跑 svn 并把每一行输出实时回调（stdout/stderr 合并）。返回 (rc, lines)"""
+    try:
+        p = subprocess.Popen(
+            [SVN_BIN] + args, cwd=cwd, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, env=SVN_ENV,
+            creationflags=_NO_WINDOW, bufsize=0,
+        )
+    except FileNotFoundError:
+        return 127, ["找不到 svn 命令"]
+    except Exception as e:
+        return 1, [str(e)]
+    lines = []
+    try:
+        for raw in iter(p.stdout.readline, b""):
+            seg = _dec(raw).replace("\r", "\n")
+            for part in seg.split("\n"):
+                part = part.strip()
+                if not part:
+                    continue
+                lines.append(part)
+                if on_line:
+                    try:
+                        on_line(part)
+                    except Exception:
+                        pass
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        lines.append("命令超时（%ds）" % timeout)
+        return 124, lines
+    return p.returncode, lines
+
+
+def start_commit(root, paths, message, add_unversioned=True):
+    """启动一个后台提交任务，返回任务 id（前端轮询拿进度）"""
+    tid = uuid.uuid4().hex[:10]
+    with TASK_LOCK:
+        CHECKOUT_TASKS[tid] = {
+            "id": tid, "kind": "commit", "status": "running",
+            "total": len(paths), "done": 0, "lines": [], "sent": [],
+            "error": "", "hint": "", "output": "", "project": "",
+            "started": time.time(),
+        }
+    threading.Thread(target=_commit_worker,
+                     args=(tid, root, list(paths), message, add_unversioned),
+                     daemon=True).start()
+    return tid
+
+
+def _commit_worker(tid, root, paths, message, add_unversioned):
+    def state(**kw):
+        with TASK_LOCK:
+            t = CHECKOUT_TASKS.get(tid)
+            if t:
+                t.update(kw)
+
+    def log(s):
+        with TASK_LOCK:
+            t = CHECKOUT_TASKS.get(tid)
+            if not t:
+                return
+            t["lines"].append(s)
+            if len(t["lines"]) > 500:
+                del t["lines"][:300]
+
+    def bump(path=""):
+        with TASK_LOCK:
+            t = CHECKOUT_TASKS.get(tid)
+            if t:
+                t["done"] = t.get("done", 0) + 1
+
+    def finish(ok, joined, note=""):
+        state(status="done" if ok else "failed",
+              error="" if ok else (note or "提交失败"),
+              output=(joined or "").strip()[-6000:])
+
+    try:
+        # 0) 先解堵：上次被打断留下的写锁会让所有写操作报「工作副本被锁定」
+        log("检查工作副本状态…")
+        rc, out, err = _cleanup(root)
+        log("工作副本就绪" if rc == 0 else "清理提示：" + (out + err).strip()[:200])
+
+        # 1) 未纳管项先 add 进版本控制
+        if add_unversioned:
+            items, _ = parse_status(root)
+            unver = {i["path"] for i in items if i["code"] == "?"}
+            to_add = [p for p in paths if p in unver]
+            if to_add:
+                log("正在加入版本控制：%d 项" % len(to_add))
+                fd, tf = tempfile.mkstemp(prefix="svnmg-", suffix=".txt")
+                os.close(fd)
+                try:
+                    with open(tf, "w", encoding="utf-8") as f:
+                        for p in to_add:
+                            f.write(os.path.join(root, p) + "\n")
+                    add_args = ["add", "--parents", "--non-interactive", "--targets", tf]
+                    rc, lines = _stream_svn(add_args, cwd=root, timeout=900, on_line=log)
+                    if rc != 0 and _looks_locked("\n".join(lines)):
+                        log("遇到残留锁，自动清理后重试…")
+                        _cleanup(root)
+                        rc, lines = _stream_svn(add_args, cwd=root, timeout=900, on_line=log)
+                    if rc != 0:
+                        finish(False, "\n".join(lines), "添加失败（未上传）")
+                        return
+                finally:
+                    try:
+                        os.unlink(tf)
+                    except OSError:
+                        pass
+
+        # 2) 真正提交
+        abs_paths = [safe_join(root, p) for p in paths]
+        fd, tf = tempfile.mkstemp(prefix="svnmg-", suffix=".txt")
+        os.close(fd)
+        try:
+            with open(tf, "w", encoding="utf-8") as f:
+                for p in abs_paths:
+                    f.write(p + "\n")
+
+            def on_line(s):
+                log(s)
+                act, path = _parse_action(s)
+                if act:
+                    bump()
+                    with TASK_LOCK:
+                        t = CHECKOUT_TASKS.get(tid)
+                        if t and path:
+                            t["sent"].append({"action": act, "path": path})
+
+            log("开始上传：共 %d 项（大文件可能较慢，别关窗口）" % len(abs_paths))
+            commit_args = ["commit", "-m", message, "--encoding", "UTF-8",
+                           "--non-interactive", "--targets", tf]
+            rc, lines = _stream_svn(commit_args, cwd=root, timeout=7200, on_line=on_line)
+            joined = "\n".join(lines)
+            if rc != 0 and _looks_locked(joined):
+                log("工作副本被上次中断留下的锁挡住，自动清理后重试…")
+                _cleanup(root)
+                rc, lines = _stream_svn(commit_args, cwd=root, timeout=7200, on_line=on_line)
+                joined = "（已自动清理残留锁并重试）\n" + "\n".join(lines)
+            ok = rc == 0
+            if ok:
+                state(done=len(abs_paths))
+            finish(ok, joined, "提交失败（服务器没收到）")
+        finally:
+            try:
+                os.unlink(tf)
+            except OSError:
+                pass
+    except Exception as e:
+        finish(False, str(e), "提交出错")
 
 
 def do_commit(root, paths, message, add_unversioned=True):
@@ -633,6 +827,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "任务不存在"}, 404)
             return self._json(t)
 
+        if p == "/api/commit/status":
+            t = get_task((q.get("id") or [""])[0])
+            if not t:
+                return self._json({"error": "任务不存在"}, 404)
+            return self._json(t)
+
         if p == "/api/log":
             pr = find_project((q.get("name") or [""])[0])
             if not pr:
@@ -775,8 +975,14 @@ class Handler(BaseHTTPRequestHandler):
             pr = find_project(b.get("name"))
             if not pr:
                 return self._json({"ok": False, "output": "项目不存在"})
-            return self._json(do_commit(pr["path"], b.get("paths") or [],
-                                        b.get("message") or "", b.get("add_unversioned", True)))
+            paths = b.get("paths") or []
+            msg = b.get("message") or ""
+            if not paths:
+                return self._json({"ok": False, "output": "没有选中任何文件"})
+            if not msg.strip():
+                return self._json({"ok": False, "output": "提交信息不能为空"})
+            tid = start_commit(pr["path"], paths, msg, b.get("add_unversioned", True))
+            return self._json({"ok": True, "id": tid, "total": len(paths)})
 
         if p == "/api/reveal":
             pr = find_project(b.get("name"))
@@ -962,6 +1168,22 @@ pre.diff .hunk{color:var(--accent)}
   color:var(--green);font-size:12px;line-height:1.6;font-weight:500}
 #coLog details summary{cursor:pointer;margin-top:8px;outline:none}
 .loading{opacity:.5;pointer-events:none}
+/* 提交进度 */
+#cProgWrap{flex:none;padding:8px 16px 0;display:none}
+.cprog{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:9px 12px;font-size:12px}
+.cprog .top{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.cprog .top b{font-size:12.5px}
+.cprog .top span{color:var(--muted);font-size:11.5px}
+.cprog .bar{height:7px;border-radius:5px;background:var(--hover);overflow:hidden;margin:7px 0 6px}
+.cprog .bar i{display:block;height:100%;width:0;background:var(--accent);border-radius:5px;
+  transition:width .25s ease}
+.cprog.ok .bar i{background:var(--green)}
+.cprog.bad .bar i{background:var(--red)}
+.cprog pre{max-height:96px;overflow:auto;margin:0;font-family:"SF Mono",Menlo,Consolas,monospace;
+  font-size:11px;line-height:1.5;color:var(--muted);white-space:pre-wrap;word-break:break-all}
+.cprog .cur{color:var(--fg);font-size:11.5px;margin-bottom:4px;word-break:break-all}
+tr.row.sent td{opacity:.45}
+tr.row.sent td::after{content:""}
 </style>
 </head>
 <body>
@@ -992,6 +1214,8 @@ pre.diff .hunk{color:var(--accent)}
       <div class="tab" data-tab="log" onclick="setTab('log')">历史</div>
       <div class="tab" data-tab="info" onclick="setTab('info')">详情</div>
     </div>
+
+    <div id="cProgWrap"></div>
 
     <div class="body" id="body">
       <div class="empty">← 从左侧选择一个项目</div>
@@ -1279,20 +1503,79 @@ async function doDelete(paths){
     $('#body').innerHTML = `<pre class="out">${esc(d.output||'')}</pre>`;
   }
 }
+let commitTaskId = null;
+function hideCommitProg(){
+  const w = $('#cProgWrap'); if(w){ w.style.display='none'; w.innerHTML=''; }
+}
+function markSent(sent){
+  const ps = (sent||[]).map(x=>x.path||'').filter(Boolean);
+  if(!ps.length) return;
+  document.querySelectorAll('#body tr.row').forEach(tr=>{
+    const p = tr.getAttribute('data-p')||'';
+    if(p && ps.some(s=> s===p || s.endsWith('/'+p) || s.endsWith(p))) tr.classList.add('sent');
+  });
+}
+function renderCommitProg(t, total){
+  const w = $('#cProgWrap'); if(!w) return;
+  w.style.display = 'block';
+  const tot = t.total || total || 0;
+  const done = Math.min(t.done||0, tot || (t.done||0));
+  const pct = tot ? Math.min(100, Math.round(done/tot*100)) : (t.status==='running'?8:100);
+  const cls = t.status==='running' ? '' : (t.status==='done' ? 'ok' : 'bad');
+  const title = t.status==='running' ? '正在上传…' : (t.status==='done' ? '✓ 上传完成' : '✗ 上传失败');
+  const sent = t.sent||[];
+  const last = sent.length ? (sent[sent.length-1].action + '  ' + sent[sent.length-1].path) : '';
+  const lines = (t.lines||[]).slice(-4).join('\n');
+  w.innerHTML = `<div class="cprog ${cls}">
+    <div class="top"><b>${esc(title)}</b><span>已完成 ${done} / ${tot} 项${t.status==='running'?'（别关窗口）':''}</span></div>
+    <div class="bar"><i style="width:${pct}%"></i></div>
+    ${last?`<div class="cur">正在处理：${esc(last)}</div>`:''}
+    <pre>${esc(lines)}</pre>
+  </div>`;
+  markSent(sent);
+}
 async function doCommit(){
   const paths = [...S.sel];
   const msg = $('#msg').value.trim();
   if(!paths.length) return toast('先选中要提交的文件');
   if(!msg) { toast('提交信息不能为空'); $('#msg').focus(); return; }
   if(!confirm(`确认提交 ${paths.length} 项到「${S.cur}」？\n\n${msg}`)) return;
-  $('#body').classList.add('loading'); $('#btnCommit').disabled = true;
-  toast('正在提交…', 120000);
+  $('#btnCommit').disabled = true;
   const d = await api('/api/commit', {name:S.cur, paths, message:msg, add_unversioned:true});
-  $('#body').classList.remove('loading');
-  toast(d.ok?'✓ 提交成功':'✗ 提交失败', 4000);
-  $('#body').innerHTML = `<pre class="out">${esc(d.output||'')}</pre>`;
-  if(d.ok){ $('#msg').value=''; S.sel.clear(); }
-  await refreshAll(); await loadStatus();
+  if(!d.ok || !d.id){
+    toast('✗ ' + (d.output || '提交没能开始'), 5000);
+    $('#btnCommit').disabled = false;
+    return;
+  }
+  commitTaskId = d.id;
+  renderCommitProg({status:'running', done:0, total:d.total||paths.length, sent:[], lines:['正在检查工作副本…']}, paths.length);
+  pollCommit(paths.length);
+}
+async function pollCommit(total){
+  if(!commitTaskId) return;
+  const t = await api('/api/commit/status?id='+commitTaskId);
+  if(t.error){
+    hideCommitProg(); toast('✗ '+t.error, 4000); commitTaskId = null;
+    $('#btnCommit').disabled = false; return;
+  }
+  renderCommitProg(t, total);
+  if(t.status === 'running'){ setTimeout(()=>pollCommit(total), 800); return; }
+  commitTaskId = null;
+  if(t.status === 'done'){
+    toast('✓ 提交成功', 3000);
+    $('#msg').value = ''; S.sel.clear();
+    await refreshAll(); await loadStatus();
+    setTimeout(hideCommitProg, 6000);
+  } else {
+    toast('✗ ' + (t.error || '提交失败'), 6000);
+    const w = $('#cProgWrap');
+    const raw = (t.output||'').split('\n').slice(-8).join('\n');
+    if(w && raw){
+      w.style.display='block';
+      w.innerHTML += `<div class="cprog bad" style="margin-top:8px"><div class="top"><b>${esc(t.error||'提交失败')}</b><span>服务器没收到这批文件</span></div><pre>${esc(raw)}</pre></div>`;
+    }
+    await refreshAll(); await loadStatus();
+  }
 }
 async function reveal(p){ await api('/api/reveal', {name:S.cur, path:p||''}); }
 function revealRoot(){ api('/api/reveal', {name:S.cur, path:''}); }
