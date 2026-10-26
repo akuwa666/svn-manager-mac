@@ -465,11 +465,16 @@ def _parse_action(line):
     low = line.lower()
     for key, label in _ACTIONS:
         if low.startswith(key) and len(low) > len(key) and low[len(key)] in " \t":
-            return label, line[len(key):].strip()
+            path = line[len(key):].strip()
+            # 二进制文件会多一个 "(二进制) " 前缀，去掉才能和列表里的路径对上
+            for pre in ("(二进制)", "（二进制）", "(binary)"):
+                if path.startswith(pre):
+                    path = path[len(pre):].strip()
+            return label, path
     return None, None
 
 
-def _stream_svn(args, cwd, timeout=1800, on_line=None):
+def _stream_svn(args, cwd, timeout=1800, on_line=None, on_pid=None):
     """跑 svn 并把每一行输出实时回调（stdout/stderr 合并）。返回 (rc, lines)"""
     try:
         p = subprocess.Popen(
@@ -481,6 +486,11 @@ def _stream_svn(args, cwd, timeout=1800, on_line=None):
         return 127, ["找不到 svn 命令"]
     except Exception as e:
         return 1, [str(e)]
+    if on_pid:
+        try:
+            on_pid(p.pid)
+        except Exception:
+            pass
     lines = []
     try:
         for raw in iter(p.stdout.readline, b""):
@@ -504,6 +514,85 @@ def _stream_svn(args, cwd, timeout=1800, on_line=None):
     return p.returncode, lines
 
 
+def _bytes_out(pid):
+    """本机实测该进程的累计发送字节（macOS 用 nettop）。拿不到就返回 None。"""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(
+            ["/usr/bin/nettop", "-P", "-p", str(pid), "-L", "1", "-x", "-n"],
+            capture_output=True, text=True, timeout=6,
+        ).stdout
+        rows = [r for r in out.strip().splitlines() if r.strip()]
+        if len(rows) < 2:
+            return None
+        head = [c.strip() for c in rows[0].split(",")]
+        if "bytes_out" not in head:
+            return None
+        vals = rows[1].split(",")
+        idx = head.index("bytes_out")
+        if idx >= len(vals):
+            return None
+        return int(vals[idx] or 0)
+    except Exception:
+        return None
+
+
+def _sum_bytes(root, paths):
+    """算出这批要上传的文件总字节数（目录会递归进去）"""
+    total = 0
+    for rel in paths:
+        try:
+            ap = safe_join(root, rel)
+        except ValueError:
+            continue
+        if os.path.isdir(ap):
+            for dp, dns, fns in os.walk(ap):
+                dns[:] = [d for d in dns if d != ".svn"]
+                for f in fns:
+                    try:
+                        total += os.path.getsize(os.path.join(dp, f))
+                    except OSError:
+                        pass
+        else:
+            try:
+                total += os.path.getsize(ap)
+            except OSError:
+                pass
+    return total
+
+
+def _byte_tracker(tid, pid):
+    """盯着 svn 子进程实际发了多少字节，换算成进度。"""
+    base = _bytes_out(pid)
+    last_t, last_b = time.time(), base or 0
+    with TASK_LOCK:
+        t = CHECKOUT_TASKS.get(tid)
+        if t:
+            t["track_pid"] = pid
+    while True:
+        with TASK_LOCK:
+            t = CHECKOUT_TASKS.get(tid)
+            if not t or t.get("status") != "running" or t.get("track_pid") != pid:
+                return
+        b = _bytes_out(pid)
+        now = time.time()
+        if b is not None:
+            if base is None:
+                base = b
+            sent = max(0, b - base)
+            speed = 0
+            if now - last_t >= 1:
+                speed = int(max(0, (b - last_b) / (now - last_t)))
+                last_t, last_b = now, b
+            with TASK_LOCK:
+                t = CHECKOUT_TASKS.get(tid)
+                if t:
+                    t["sent_bytes"] = sent
+                    t["speed"] = speed
+        time.sleep(1.5)
+
+
 def start_commit(root, paths, message, add_unversioned=True):
     """启动一个后台提交任务，返回任务 id（前端轮询拿进度）"""
     tid = uuid.uuid4().hex[:10]
@@ -511,6 +600,8 @@ def start_commit(root, paths, message, add_unversioned=True):
         CHECKOUT_TASKS[tid] = {
             "id": tid, "kind": "commit", "status": "running",
             "total": len(paths), "done": 0, "lines": [], "sent": [],
+            "total_bytes": 0, "sent_bytes": 0, "speed": 0, "phase": "",
+            "track_pid": None,
             "error": "", "hint": "", "output": "", "project": "",
             "started": time.time(),
         }
@@ -592,6 +683,8 @@ def _commit_worker(tid, root, paths, message, add_unversioned):
 
             def on_line(s):
                 log(s)
+                if "传输文件数据" in s or "transmitting file data" in s.lower():
+                    state(phase="transfer")
                 act, path = _parse_action(s)
                 if act:
                     bump()
@@ -600,19 +693,29 @@ def _commit_worker(tid, root, paths, message, add_unversioned):
                         if t and path:
                             t["sent"].append({"action": act, "path": path})
 
-            log("开始上传：共 %d 项（大文件可能较慢，别关窗口）" % len(abs_paths))
+            total_bytes = _sum_bytes(root, paths)
+            state(total_bytes=total_bytes, sent_bytes=0, speed=0, phase="prepare")
+
+            def on_pid(pid):
+                threading.Thread(target=_byte_tracker, args=(tid, pid), daemon=True).start()
+
+            log("开始上传：共 %d 项 / %.1f MB（大文件可能较慢，别关窗口）"
+                % (len(abs_paths), total_bytes / 1048576.0))
             commit_args = ["commit", "-m", message, "--encoding", "UTF-8",
                            "--non-interactive", "--targets", tf]
-            rc, lines = _stream_svn(commit_args, cwd=root, timeout=7200, on_line=on_line)
+            rc, lines = _stream_svn(commit_args, cwd=root, timeout=7200,
+                                    on_line=on_line, on_pid=on_pid)
             joined = "\n".join(lines)
             if rc != 0 and _looks_locked(joined):
                 log("工作副本被上次中断留下的锁挡住，自动清理后重试…")
                 _cleanup(root)
-                rc, lines = _stream_svn(commit_args, cwd=root, timeout=7200, on_line=on_line)
+                state(sent_bytes=0, speed=0, phase="prepare")
+                rc, lines = _stream_svn(commit_args, cwd=root, timeout=7200,
+                                        on_line=on_line, on_pid=on_pid)
                 joined = "（已自动清理残留锁并重试）\n" + "\n".join(lines)
             ok = rc == 0
             if ok:
-                state(done=len(abs_paths))
+                state(done=len(abs_paths), sent_bytes=total_bytes)
             finish(ok, joined, "提交失败（服务器没收到）")
         finally:
             try:
@@ -1177,6 +1280,9 @@ pre.diff .hunk{color:var(--accent)}
 .cprog .bar{height:7px;border-radius:5px;background:var(--hover);overflow:hidden;margin:7px 0 6px}
 .cprog .bar i{display:block;height:100%;width:0;background:var(--accent);border-radius:5px;
   transition:width .25s ease}
+.cprog .bar i.run{background-image:linear-gradient(90deg,rgba(255,255,255,.3) 0 12px,transparent 12px 26px);
+  background-size:26px 100%;animation:cpstrip .8s linear infinite}
+@keyframes cpstrip{from{background-position:0 0}to{background-position:26px 0}}
 .cprog.ok .bar i{background:var(--green)}
 .cprog.bad .bar i{background:var(--red)}
 .cprog pre{max-height:96px;overflow:auto;margin:0;font-family:"SF Mono",Menlo,Consolas,monospace;
@@ -1515,20 +1621,45 @@ function markSent(sent){
     if(p && ps.some(s=> s===p || s.endsWith('/'+p) || s.endsWith(p))) tr.classList.add('sent');
   });
 }
+function fmtMB(b){ return (b/1048576).toFixed(1); }
+function fmtSpeed(bps){
+  if(!bps || bps < 1) return '';
+  return bps > 1048576 ? (bps/1048576).toFixed(1)+' MB/s' : Math.round(bps/1024)+' KB/s';
+}
+function fmtEta(sec){
+  if(!sec || sec <= 0) return '';
+  if(sec < 60) return '约剩 '+Math.ceil(sec)+' 秒';
+  return '约剩 '+Math.floor(sec/60)+' 分 '+(sec%60)+' 秒';
+}
 function renderCommitProg(t, total){
   const w = $('#cProgWrap'); if(!w) return;
   w.style.display = 'block';
   const tot = t.total || total || 0;
   const done = Math.min(t.done||0, tot || (t.done||0));
-  const pct = tot ? Math.min(100, Math.round(done/tot*100)) : (t.status==='running'?8:100);
-  const cls = t.status==='running' ? '' : (t.status==='done' ? 'ok' : 'bad');
-  const title = t.status==='running' ? '正在上传…' : (t.status==='done' ? '✓ 上传完成' : '✗ 上传失败');
+  const tb = t.total_bytes||0, sb = t.sent_bytes||0, sp = t.speed||0;
+  const running = t.status === 'running';
+  const useBytes = tb > 0 && (sb > 0 || t.phase === 'transfer');
+  const byItems = tot ? Math.round(done/tot*100) : 0;
+  const byBytes = useBytes ? Math.round(sb/tb*100) : 0;
+  let pct = running
+    ? Math.min(99, Math.max(useBytes?1:3, useBytes ? byBytes : byItems))
+    : (t.status==='done' ? 100 : Math.min(99, useBytes ? byBytes : byItems));
+  const cls = running ? '' : (t.status==='done' ? 'ok' : 'bad');
+  const title = running
+    ? (t.phase === 'transfer' ? '正在传输文件数据…（别关窗口）'
+        : (useBytes ? '正在上传…（别关窗口）' : '正在准备上传…'))
+    : (t.status==='done' ? '✓ 上传完成' : '✗ 上传失败');
   const sent = t.sent||[];
   const last = sent.length ? (sent[sent.length-1].action + '  ' + sent[sent.length-1].path) : '';
+  const parts = [];
+  if(useBytes) parts.push('已传 ' + fmtMB(sb) + ' / ' + fmtMB(tb) + ' MB');
+  parts.push(done + ' / ' + tot + ' 项');
+  if(running && sp) parts.push(fmtSpeed(sp));
+  if(running && sp && useBytes && tb > sb) parts.push(fmtEta(Math.round((tb-sb)/sp)));
   const lines = (t.lines||[]).slice(-4).join('\n');
   w.innerHTML = `<div class="cprog ${cls}">
-    <div class="top"><b>${esc(title)}</b><span>已完成 ${done} / ${tot} 项${t.status==='running'?'（别关窗口）':''}</span></div>
-    <div class="bar"><i style="width:${pct}%"></i></div>
+    <div class="top"><b>${esc(title)}</b><span>${esc(parts.join(' · '))}</span></div>
+    <div class="bar"><i class="${running?'run':''}" style="width:${pct}%"></i></div>
     ${last?`<div class="cur">正在处理：${esc(last)}</div>`:''}
     <pre>${esc(lines)}</pre>
   </div>`;
