@@ -4,6 +4,7 @@
 SVN Manager — 多项目 Subversion 图形客户端
 本地 Web 界面，零第三方依赖，直接调用系统 svn 命令行。
 """
+import datetime
 import json
 import os
 import shutil
@@ -817,6 +818,22 @@ def do_delete(root, paths):
     return {"ok": True, "output": "\n".join(m for m in msgs if m)}
 
 
+def _local_time(iso):
+    """svn log --xml 的时间是 UTC（形如 ...Z），转成本机时区再显示"""
+    s = (iso or "").strip()
+    if not s:
+        return ""
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return iso.replace("T", " ")[:19]
+
+
 def do_log(root, limit=30):
     # 工作副本根的 BASE rev 可能为 0，必须显式指定范围才能查到历史
     # raw=True：XML 带 encoding 声明，必须交给 ET 解析 bytes
@@ -840,7 +857,7 @@ def do_log(root, limit=30):
         res.append({
             "rev": e.get("revision", ""),
             "author": (e.findtext("author") or "").strip(),
-            "date": (e.findtext("date") or "").strip(),
+            "date": _local_time(e.findtext("date")),
             "msg": (e.findtext("msg") or "").strip(),
             "paths": paths[:40],
             "path_total": len(paths),
