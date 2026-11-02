@@ -1156,6 +1156,10 @@ button{font:inherit;cursor:pointer;border:none;border-radius:7px;padding:6px 12p
   background:var(--card);color:var(--fg);border:1px solid var(--line);transition:.15s}
 button:hover:not(:disabled){background:var(--hover)}
 button:disabled{opacity:.4;cursor:not-allowed}
+/* 未勾选时按钮不禁用，只变淡：点了要给出提示，不能静默无反应 */
+button.off{opacity:.5}
+button.off:hover{opacity:.85}
+#body.nudge td.cb{background:var(--accent-soft);box-shadow:inset 0 0 0 2px var(--accent)}
 button.primary{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
 button.primary:hover:not(:disabled){filter:brightness(1.1);background:var(--accent)}
 button.danger{color:var(--red)}
@@ -1351,8 +1355,8 @@ tr.row.sent td::after{content:""}
       <div class="side">
         <div class="hint" id="selhint">已选 0 项</div>
         <div class="btnrow">
-          <button class="primary" id="btnCommit" onclick="doCommit()" disabled>提交选中</button>
-          <button class="danger" id="btnDel" onclick="delSelected()" disabled>删除选中</button>
+          <button class="primary off" id="btnCommit" onclick="doCommit()">提交选中</button>
+          <button class="danger off" id="btnDel" onclick="delSelected()">删除选中</button>
         </div>
       </div>
     </div>
@@ -1528,8 +1532,8 @@ function renderStatus(){
     el.innerHTML = topBar([], hidden) + `<div class="empty">${msg}</div>`;
     S.sel.clear();
     const sh = $('#selhint'); if(sh) sh.textContent='已选 0 项';
-    const bc = $('#btnCommit'); if(bc) bc.disabled=true;
-    const bd = $('#btnDel'); if(bd) bd.disabled=true;
+    const bc = $('#btnCommit'); if(bc) bc.classList.add('off');
+    const bd = $('#btnDel'); if(bd) bd.classList.add('off');
     return;
   }
   el.innerHTML = topBar(items, hidden) + `
@@ -1565,9 +1569,16 @@ function toggleOne(i, on){
 }
 function updateSelHint(){
   const n = S.sel.size;
-  const el = $('#selhint'); if(el) el.textContent = '已选 ' + n + ' 项';
-  const bc = $('#btnCommit'); if(bc) bc.disabled = n===0;
-  const bd = $('#btnDel'); if(bd) bd.disabled = n===0;
+  const el = $('#selhint');
+  if(el) el.textContent = n ? ('已选 ' + n + ' 项') : '已选 0 项 · 请先勾选文件';
+  const bc = $('#btnCommit');
+  if(bc){ bc.disabled = !!S.committing; bc.classList.toggle('off', n===0 || !!S.committing); }
+  const bd = $('#btnDel'); if(bd) bd.classList.toggle('off', n===0);
+}
+function nudgeSelect(){
+  const t = $('#body'); if(!t) return;
+  t.classList.add('nudge');
+  setTimeout(()=>{ try{ t.classList.remove('nudge'); }catch(e){} }, 1500);
 }
 async function showDiff(path){
   $('#body').classList.add('loading');
@@ -1607,7 +1618,11 @@ async function delOne(p){
 }
 async function delSelected(){
   const paths = [...S.sel];
-  if(!paths.length) return;
+  if(!paths.length){
+    toast('还没勾选文件：先在列表左边的小方框里勾选要删除的文件', 4000);
+    nudgeSelect();
+    return;
+  }
   const list = paths.slice(0, 8).join('\n') + (paths.length > 8 ? '\n… 共 ' + paths.length + ' 项' : '');
   if(!confirm('确定删除选中的 ' + paths.length + ' 项？\n\n' + list)) return;
   await doDelete(paths);
@@ -1685,13 +1700,19 @@ function renderCommitProg(t, total){
 async function doCommit(){
   const paths = [...S.sel];
   const msg = $('#msg').value.trim();
-  if(!paths.length) return toast('先选中要提交的文件');
+  if(!paths.length){
+    toast('还没勾选文件：先在列表左边的小方框里勾选要上传的文件，再点这里', 4000);
+    nudgeSelect();
+    return;
+  }
   if(!msg) { toast('提交信息不能为空'); $('#msg').focus(); return; }
   if(!confirm(`确认提交 ${paths.length} 项到「${S.cur}」？\n\n${msg}`)) return;
+  S.committing = true;
   $('#btnCommit').disabled = true;
   const d = await api('/api/commit', {name:S.cur, paths, message:msg, add_unversioned:true});
   if(!d.ok || !d.id){
     toast('✗ ' + (d.output || '提交没能开始'), 5000);
+    S.committing = false;
     $('#btnCommit').disabled = false;
     return;
   }
@@ -1704,11 +1725,12 @@ async function pollCommit(total){
   const t = await api('/api/commit/status?id='+commitTaskId);
   if(t.error){
     hideCommitProg(); toast('✗ '+t.error, 4000); commitTaskId = null;
-    $('#btnCommit').disabled = false; return;
+    S.committing = false; $('#btnCommit').disabled = false; return;
   }
   renderCommitProg(t, total);
   if(t.status === 'running'){ setTimeout(()=>pollCommit(total), 800); return; }
   commitTaskId = null;
+  S.committing = false;
   if(t.status === 'done'){
     toast('✓ 提交成功', 3000);
     $('#msg').value = ''; S.sel.clear();
