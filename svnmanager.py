@@ -434,6 +434,44 @@ def _looks_locked(text):
     return "locked" in t and "svn" in t
 
 
+def _human_err(text):
+    """把 svn 原始报错翻译成一句人话 + 下一步动作（用户是策划，不进错误码）"""
+    t = text or ""
+    tl = t.lower()
+    if "e155011" in tl or "e160024" in tl or "已经过期" in t or "out of date" in tl:
+        return "本地版本落后：服务器上有别人更新的版本。先点顶部「更新」，再提交"
+    if "e155004" in tl or "工作副本已经锁定" in t or "working copy locked" in tl:
+        return "工作副本被上次中断留下的锁挡住：再点一次提交会自动清理重试"
+    if "e155010" in tl or "was not found" in tl or "找不到节点" in t:
+        return "有文件在本地被删掉了但没告诉 SVN：在该文件那一行点「删除」，再提交"
+    if "e200009" in tl or "not under version control" in tl:
+        return "有文件还没纳入版本控制：勾上「含未纳管」重新勾选后再提交"
+    if "e170001" in tl or "e215004" in tl or "authorization failed" in tl or "认证失败" in t:
+        return "账号或权限不对：SVN 账号没有这个目录的写权限"
+    if "e170013" in tl or "e175002" in tl or "e120105" in tl or "e670002" in tl \
+            or "could not resolve" in tl or "无法连接" in t:
+        return "没连上 SVN 服务器（网络/代理中断）：检查网络后再试一次"
+    if "e155007" in tl or "is not a working copy" in tl:
+        return "这个目录不是有效的 SVN 工作副本：在侧栏重新添加项目"
+    return "提交失败（svn 返回错误，具体原因见下面的原始信息）"
+
+
+def _log_commit(root, paths, message, rc, text):
+    """把每次提交的真实输出落到文件，出问题时能直接查"""
+    try:
+        d = os.path.expanduser("~/Library/Logs/SVNManager")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "commit.log"), "a", encoding="utf-8") as f:
+            f.write("\n===== %s  rc=%s =====\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), rc))
+            f.write("项目: %s\n提交信息: %s\n目标 %d 项:\n%s\n--- svn 输出 ---\n%s\n" % (
+                root, message, len(paths),
+                "\n".join(paths[:200]) + ("\n…(共 %d 项)" % len(paths) if len(paths) > 200 else ""),
+                (text or "").strip()))
+    except Exception:
+        pass
+
+
 def _cleanup(root):
     return svn(["cleanup", "--non-interactive"], cwd=root, timeout=1800)
 
@@ -673,6 +711,16 @@ def _commit_worker(tid, root, paths, message, add_unversioned):
                     except OSError:
                         pass
 
+        # 1.5) 预检：本地已经不见了、但没标记删除的文件，svn 会直接拒绝整批提交
+        chk, _ = parse_status(root)
+        missing = [i["path"] for i in chk if i["code"] == "!" and i["path"] in paths]
+        if missing:
+            detail = "这些文件在本地已经不存在，SVN 还认为它们在：\n" + "\n".join(missing)
+            _log_commit(root, paths, message, "preflight", detail)
+            finish(False, detail,
+                   "有 %d 个文件在本地被删掉了但没告诉 SVN（在这行点「删除」再提交）" % len(missing))
+            return
+
         # 2) 真正提交
         abs_paths = [safe_join(root, p) for p in paths]
         fd, tf = tempfile.mkstemp(prefix="svnmg-", suffix=".txt")
@@ -715,9 +763,10 @@ def _commit_worker(tid, root, paths, message, add_unversioned):
                                         on_line=on_line, on_pid=on_pid)
                 joined = "（已自动清理残留锁并重试）\n" + "\n".join(lines)
             ok = rc == 0
+            _log_commit(root, paths, message, rc, joined)
             if ok:
                 state(done=len(abs_paths), sent_bytes=total_bytes)
-            finish(ok, joined, "提交失败（服务器没收到）")
+            finish(ok, joined, _human_err(joined))
         finally:
             try:
                 os.unlink(tf)
@@ -1742,7 +1791,7 @@ async function pollCommit(total){
     const raw = (t.output||'').split('\n').slice(-8).join('\n');
     if(w && raw){
       w.style.display='block';
-      w.innerHTML += `<div class="cprog bad" style="margin-top:8px"><div class="top"><b>${esc(t.error||'提交失败')}</b><span>服务器没收到这批文件</span></div><pre>${esc(raw)}</pre></div>`;
+      w.innerHTML += `<div class="cprog bad" style="margin-top:8px"><div class="top"><b>${esc(t.error||'提交失败')}</b><span>没有提交上去，原因见下</span></div><pre>${esc(raw)}</pre></div>`;
     }
     await refreshAll(); await loadStatus();
   }
