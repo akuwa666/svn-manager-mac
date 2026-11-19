@@ -867,6 +867,25 @@ def do_delete(root, paths):
     return {"ok": True, "output": "\n".join(m for m in msgs if m)}
 
 
+def do_restore(root, rel):
+    """把误删 / 冲突的项恢复成服务器上的版本：先撤销本地改动，再更新到最新"""
+    try:
+        p = safe_join(root, rel)
+    except ValueError as e:
+        return {"ok": False, "output": str(e)}
+    msgs = []
+    rc, out, err = svn(["revert", "-R", "--non-interactive", p], cwd=root, timeout=1800)
+    msgs.append((out + err).strip())
+    if rc != 0:
+        return {"ok": False, "output": "\n".join(m for m in msgs if m),
+                "hint": _human_err("\n".join(msgs))}
+    rc2, out2, err2 = svn(["update", "--non-interactive", "--accept", "postpone", p],
+                          cwd=root, timeout=3600)
+    msgs.append((out2 + err2).strip())
+    return {"ok": rc2 == 0, "output": "\n".join(m for m in msgs if m),
+            "hint": "" if rc2 == 0 else _human_err("\n".join(msgs))}
+
+
 def _local_time(iso):
     """svn log --xml 的时间是 UTC（形如 ...Z），转成本机时区再显示"""
     s = (iso or "").strip()
@@ -1152,6 +1171,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "output": "提交信息不能为空"})
             tid = start_commit(pr["path"], paths, msg, b.get("add_unversioned", True))
             return self._json({"ok": True, "id": tid, "total": len(paths)})
+
+        if p == "/api/restore":
+            pr = find_project(b.get("name"))
+            if not pr:
+                return self._json({"ok": False, "output": "项目不存在"})
+            rel = b.get("path") or ""
+            if not rel:
+                return self._json({"ok": False, "output": "没有指定要恢复的项"})
+            return self._json(do_restore(pr["path"], rel))
 
         if p == "/api/reveal":
             pr = find_project(b.get("name"))
@@ -1598,6 +1626,7 @@ function renderStatus(){
           <td class="tm" title="${fullTime(it.mtime)}">${fmtTime(it.mtime)}</td>
           <td class="act">
             ${it.code==='?'?'':`<button onclick="showDiff('${esc(it.path).replace(/'/g,"\\'")}')">差异</button>`}
+            ${['C','D','!','~'].indexOf(it.code)>=0?`<button onclick="restoreOne('${esc(it.path).replace(/'/g,"\\'")}')">恢复</button>`:''}
             <button onclick="reveal('${esc(it.path).replace(/'/g,"\\'")}')">定位</button>
             <button class="del" onclick="delOne('${esc(it.path).replace(/'/g,"\\'")}')">删除</button>
           </td>
@@ -1660,6 +1689,25 @@ async function doCleanup(){
   toast(d.ok?'清理完成':'清理出错');
   $('#body').innerHTML = `<pre class="out">${esc(d.output||'')}</pre>`;
   await loadStatus();
+}
+async function restoreOne(p){
+  if(!confirm('把这一项恢复成服务器上的版本？\n\n' + p +
+    '\n\n· 你本地的删除 / 修改会被撤销\n· 同时会更新到服务器最新版本')) return;
+  $('#body').classList.add('loading');
+  toast('正在恢复…', 60000);
+  const d = await api('/api/restore', {name:S.cur, path:p});
+  $('#body').classList.remove('loading');
+  if(d.ok){
+    toast('✓ 已恢复成服务器版本', 3000);
+  } else {
+    toast('✗ ' + (d.hint || '恢复失败'), 6000);
+    const w = $('#cProgWrap');
+    if(w && d.output){
+      w.style.display='block';
+      w.innerHTML = `<div class="cprog bad"><div class="top"><b>${esc(d.hint||'恢复失败')}</b><span>原因见下</span></div><pre>${esc(d.output)}</pre></div>`;
+    }
+  }
+  await refreshAll(); await loadStatus();
 }
 async function delOne(p){
   if(!confirm('确定删除？\n\n' + p + '\n\n· 已纳入版本控制 → 标记为删除，提交后生效（可撤销）\n· 未纳管 → 直接从磁盘移除文件')) return;
